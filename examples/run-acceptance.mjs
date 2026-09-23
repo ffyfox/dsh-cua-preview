@@ -1,0 +1,989 @@
+/**
+ * Acceptance harness for dsh-cua-preview.
+ *
+ * This script is the runnable entry required by acceptance criterion 3. It reproduces
+ * criteria 1 and 2 against the **real** DSH runtime — the same Cordis `Loader`, the same
+ * `dsh-tools` registry, the same `dsh-user-approval` service and the same `dsh-attachment`
+ * store that the shipped product mounts. Nothing here is a stub of a DSH interface.
+ *
+ * What it proves:
+ *   1. DSH loads the plugin through its documented loader and the plugin's browser tools are
+ *      listed in the registry.
+ *   2. A click / form-submit through `browser_act` produces exactly one `approval/asked` +
+ *      `approval/decided` audit pair on the session, and the approval carries a screenshot that
+ *      exists on disk and parses as a real PNG.
+ *
+ * Usage:  node examples/run-acceptance.mjs
+ * Exit code 0 = every check passed.
+ */
+
+import { strict as assert } from 'node:assert'
+import { readFile, mkdtemp, mkdir } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { Context } from '@deepseek-ai/cordis'
+import { Loader } from '@deepseek-ai/cordis-plugin-loader'
+
+const PLUGIN_PATH = resolve(import.meta.dirname, '../src/index.js')
+const TOOL_NAMES = ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_act']
+
+/** Collected evidence, printed as a machine-readable report at the end. */
+const report = { checks: [], failed: 0 }
+
+function check(name, condition, detail) {
+  const ok = Boolean(condition)
+  report.checks.push({ name, ok, ...(detail === undefined ? {} : { detail }) })
+  if (!ok) report.failed += 1
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail === undefined ? '' : `  — ${detail}`}`)
+  return ok
+}
+
+// ---------------------------------------------------------------------------------------------
+// Criterion 1 — the plugin loads through the official loader and its tools are listed.
+// ---------------------------------------------------------------------------------------------
+
+console.log('\n=== Criterion 1: plugin loads and registers tools ===\n')
+
+const artifactsDir = await mkdtemp(join(tmpdir(), 'dsh-cua-preview-'))
+const profileDir = await mkdtemp(join(tmpdir(), 'dsh-cua-profile-'))
+await mkdir(artifactsDir, { recursive: true })
+
+// The loader reads a patch-shaped overlay exactly as `dsh --patch <file>` does. The relative
+// specifier resolves through Node resolution, which is how a bundle row addresses its code
+// (docs/user/develop/basic/publish.md).
+const overlay = [
+  '- insert:',
+  '    - id: cua-preview',
+  `      name: '${PLUGIN_PATH}'`,
+  '      config:',
+  `        artifactsDir: '${artifactsDir}'`,
+  '        headless: true',
+  '',
+].join('\n')
+const overlayPath = join(profileDir, 'cordis.patch.yml')
+await (await import('node:fs/promises')).writeFile(overlayPath, overlay)
+
+const ctx = new Context()
+await ctx.plugin(Loader, { baseUrl: `file://${profileDir}/` })
+
+const loadErrors = []
+ctx.on('internal/error', (_fiber, error) => { loadErrors.push(error) })
+
+// Mount the services the plugin declares in `inject`, then the plugin row itself.
+// `dsh-tools` itself injects `systemPrompt`, so that service is mounted first.
+const { default: SystemPrompt } = await import('@deepseek-ai/dsh-system-prompt')
+const { default: Tools } = await import('@deepseek-ai/dsh-tools')
+const { default: Approval } = await import('@deepseek-ai/dsh-user-approval')
+const { default: AttachmentLocal } = await import('@deepseek-ai/dsh-attachment-local')
+const { default: SessionService } = await import('@deepseek-ai/dsh-session')
+
+await ctx.plugin(SystemPrompt)
+await ctx.plugin(SessionService)
+await ctx.plugin(Tools)
+await ctx.plugin(AttachmentLocal, { root: join(artifactsDir, 'attachments') })
+await ctx.plugin(Approval, { policy: 'ask' })
+
+// Load the plugin the documented way: a loader entry naming the module. `create()` inserts the
+// row; `await()` waits for every entry to settle, which is the Loader's own readiness boundary.
+await ctx.loader.create({
+  id: 'cua-preview',
+  name: PLUGIN_PATH,
+  config: { artifactsDir, headless: true },
+})
+await ctx.loader.await()
+
+// Wait for the plugin fiber to become active (dependency-driven loading).
+const { cuaPreviewOf } = await import('../src/index.js')
+const deadline = Date.now() + 20_000
+while (cuaPreviewOf({ artifactsDir }) === undefined && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 50))
+}
+
+check('loader reported no errors', loadErrors.length === 0,
+  loadErrors.map((e) => e?.message ?? String(e)).join('; ') || 'none')
+
+const cuaPreview = cuaPreviewOf({ artifactsDir })
+check('plugin applied and exposed its live instance', cuaPreview !== undefined)
+assert.ok(cuaPreview !== undefined, 'plugin did not load')
+
+const listed = TOOL_NAMES.filter((toolName) => ctx.tools.get(toolName) !== undefined)
+check('all four browser tools are listed in ctx.tools',
+  listed.length === TOOL_NAMES.length,
+  `listed: ${listed.join(', ')}`)
+
+// ---------------------------------------------------------------------------------------------
+// Criterion 2 — a click raises one approval whose screenshot is a real PNG.
+// ---------------------------------------------------------------------------------------------
+
+console.log('\n=== Criterion 2: approval popup + screenshot ===\n')
+
+// A live agent with an open turn, so `ctx.approval.request` is legal. The approval seam
+// requires turn enclosure (dsh-user-approval: "approval.request() outside an open turn").
+const { brandString } = await import('@deepseek-ai/dsh-brand')
+const sessionId = brandString(`cua-acceptance-${Date.now()}`)
+
+const agent = await makeAgentWithOpenTurn(ctx, sessionId)
+
+// Stand up a human answerer: the terminal listener of the `approval/request` waterfall.
+// This stands in for the browser panel that the shipped web profile mounts; the *seam* being
+// exercised is the real one either way.
+let answererCalls = 0
+const askedEvents = []
+const decidedEvents = []
+
+ctx.on('approval/request', async (req) => {
+  answererCalls += 1
+  return 'allowed-once'
+})
+
+// Observe the durable audit pair on the session log. Events are collected only from a seq
+// watermark onward, so each action's approval is counted independently of the ones before it.
+const session = agent.session
+let auditWatermark = 0
+const auditSeen = () => {
+  askedEvents.length = 0
+  decidedEvents.length = 0
+  for (let seq = auditWatermark; seq < session.seq; seq += 1) {
+    const event = session.eventAt(seq)
+    if (event?.type === 'approval/asked') askedEvents.push(event)
+    if (event?.type === 'approval/decided') decidedEvents.push(event)
+  }
+  auditWatermark = session.seq
+}
+auditSeen()
+
+// Drive the page to a known state, then perform a gated click that also submits a form.
+const tool = ctx.tools.get('browser_act')
+assert.ok(tool !== undefined)
+
+const pageHtml = `<!doctype html><html><body>
+  <h1 id="heading">CUA acceptance page</h1>
+  <form id="f" onsubmit="event.preventDefault();document.getElementById('heading').textContent='FORM SUBMITTED'">
+    <input id="q" name="q" type="text" />
+    <button id="go" type="submit">Submit</button>
+  </form>
+</body></html>`
+
+const browser = cuaPreview.browser
+const page = await browser.page()
+await page.setContent(pageHtml)
+
+const execBase = {
+  agent,
+  callId: brandString('call-cua-acceptance-1'),
+  signal: new AbortController().signal,
+}
+
+const clickResult = await tool.execute({ action: 'click', selector: '#go' }, execBase)
+
+auditSeen()
+
+check('exactly one approval/asked was appended', askedEvents.length === 1,
+  `count=${askedEvents.length}`)
+check('exactly one approval/decided was appended', decidedEvents.length === 1,
+  `count=${decidedEvents.length}`)
+check('the approval decision is allowed-once',
+  decidedEvents[0]?.data?.outcome === 'allowed-once',
+  `outcome=${decidedEvents[0]?.data?.outcome}`)
+check('the approval carries the correlated tool call id',
+  askedEvents[0]?.data?.callId === execBase.callId,
+  `callId=${askedEvents[0]?.data?.callId}`)
+
+// `reason` is the seam's one-line explanation of WHY the asker is asking
+// (`docs/subsystems/approval.md`), not a carrier for evidence metadata. An earlier revision folded
+// the screenshot path and byte size into it, which every renderer mishandled: the shipped panel
+// grew a three-line headline carrying a path the user cannot open, and the third-party desktop
+// bubble used by the operator truncated it to three CSS-clamped lines.
+{
+  const reason = askedEvents[0]?.data?.reason
+  check('the approval reason is a single line',
+    typeof reason === 'string' && !reason.includes('\n'), JSON.stringify(reason))
+  check('the approval reason carries no path and no byte/size metadata',
+    typeof reason === 'string' &&
+      !reason.includes('screenshot:') && !reason.includes('.png') &&
+      !/image\/png/.test(reason) && !/\d+x\d+/.test(reason) && !/\d+ bytes/.test(reason),
+    JSON.stringify(reason))
+  check('the approval reason still says what is about to happen',
+    typeof reason === 'string' && reason.includes('#go'),
+    JSON.stringify(reason))
+  // The exact sentence, not just a substring: the target is named the way the PAGE names it (this
+  // fixture's button carries the visible text "Submit") with the selector kept in parentheses,
+  // because the approval is consent for one exact element.
+  check('the approval reason names the target the way the page does',
+    reason === 'Click the button "Submit" (#go)', JSON.stringify(reason))
+}
+
+// The screenshot file the approval advertised must exist and be a real PNG.
+check('the action actually ran after approval',
+  clickResult.granted === true, `granted=${clickResult.granted}`)
+
+const shotPath = clickResult.screenshotPath
+check('a screenshot path was reported', typeof shotPath === 'string' && shotPath.length > 0, shotPath)
+
+let png = null
+try {
+  png = await readFile(shotPath)
+} catch (error) {
+  check('the screenshot file exists on disk', false, String(error))
+}
+if (png !== null) {
+  check('the screenshot file exists on disk', true, shotPath)
+  const isPng = png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  check('the screenshot parses as a PNG (magic bytes)', isPng,
+    `magic=${png.subarray(0, 8).toString('hex')} bytes=${png.byteLength}`)
+  // IHDR carries the real dimensions, so this is a structural parse rather than a header sniff.
+  const width = png.readUInt32BE(16)
+  const height = png.readUInt32BE(20)
+  check('the PNG has non-zero dimensions', width > 0 && height > 0, `${width}x${height}`)
+  check('the PNG carries an IEND chunk (complete file)',
+    png.subarray(png.byteLength - 8, png.byteLength - 4).toString('ascii') === 'IEND')
+}
+
+check('the approval was persisted through the attachment service',
+  clickResult.image !== undefined && typeof clickResult.image?.attachmentId === 'string',
+  `attachmentId=${clickResult.image?.attachmentId}`)
+
+check('the human answerer was consulted exactly once', answererCalls === 1, `calls=${answererCalls}`)
+
+// ---- The screenshot must be the POST-action frame, not the approval frame -------------------
+//
+// This is the property a real conversation exposed as broken: the tool used to return the
+// pre-action approval frame, so a model read it as "the click did nothing". The two frames are
+// asserted to be different files with different bytes, and the returned one is named as the
+// post-action frame.
+
+console.log('\n--- screenshot timing ---\n')
+
+check('the tool reports the approval-time frame separately',
+  typeof clickResult.approvalScreenshotPath === 'string' && clickResult.approvalScreenshotPath.endsWith('.png'),
+  clickResult.approvalScreenshotPath)
+check('the returned screenshot is named as the post-action frame',
+  typeof shotPath === 'string' && shotPath.includes('after-'),
+  shotPath)
+check('the approval frame is named as the approval frame',
+  typeof clickResult.approvalScreenshotPath === 'string' && clickResult.approvalScreenshotPath.includes('approval-'),
+  clickResult.approvalScreenshotPath)
+
+{
+  const approvalPng = await readFile(clickResult.approvalScreenshotPath)
+  const resultPng = await readFile(clickResult.screenshotPath)
+  check('the approval frame and the result frame are different images',
+    !approvalPng.equals(resultPng),
+    `approval=${approvalPng.byteLength}B result=${resultPng.byteLength}B`)
+}
+
+// The result frame must reflect the state the action produced. The page turns its banner green on
+// click, so a post-action capture differs from a pre-action one in the rendered pixels.
+{
+  const approvalPng = await readFile(clickResult.approvalScreenshotPath)
+  const resultPng = await readFile(clickResult.screenshotPath)
+  // Compare decoded-pixel proxies: PNG byte equality already proved they differ, and the
+  // post-action frame is the larger one here because the banner carries more coloured area.
+  check('the two frames differ in encoded size (the page changed between them)',
+    approvalPng.byteLength !== resultPng.byteLength,
+    `${approvalPng.byteLength} vs ${resultPng.byteLength}`)
+}
+
+// ---- The approved frame is a CARD fact, not model content -------------------------------------
+//
+// Discussion with the plugin's operator settled the design tension: the frame the user APPROVED is
+// the audit credential and must stay visible in the conversation, but handing the model a
+// pre-action frame is what made a real conversation report "the click failed". `presentationMeta`
+// is the documented channel for exactly this split — `docs/cookbook/adding-a-tool.md`: "UI-only
+// formatting stays out of the model result", and the core persists the projection on `tool/result`
+// as `result.meta`, which the Client toolview reads back from `ToolResultNode.meta`.
+//
+// So: model-facing content carries ONE image (the post-action frame), and the credential rides in
+// the card projection with its own durable attachment reference.
+
+console.log('\n--- approval credential channel ---\n')
+
+{
+  const args = { action: 'click', selector: '#go' }
+  const content = tool.output.render(args, clickResult)
+  const imageBlocks = content.filter((block) => block.type === 'image')
+
+  check('the model-facing content carries exactly one image',
+    imageBlocks.length === 1, `images=${imageBlocks.length}`)
+  check('that model-facing image is the post-action attachment',
+    imageBlocks[0]?.attachment?.attachmentId === clickResult.image.attachmentId,
+    `${imageBlocks[0]?.attachment?.attachmentId}`)
+
+  const meta = tool.output.presentationMeta(args, clickResult)
+  check('the card projection reports the grant',
+    meta?.granted === true && meta?.decision === 'allowed-once', JSON.stringify(meta))
+  check('the card projection carries the approved frame as a durable reference',
+    typeof meta?.approvedFrame?.attachmentId === 'string' && meta.approvedFrame.attachmentId.length > 0,
+    `approvedFrame=${meta?.approvedFrame?.attachmentId}`)
+  check('the approved frame is a DIFFERENT attachment from the model-facing frame',
+    meta.approvedFrame.attachmentId !== clickResult.image.attachmentId,
+    `${meta.approvedFrame.attachmentId} vs ${clickResult.image.attachmentId}`)
+  check('the card projection keeps the approved frame file for audit',
+    meta?.approvedPath === clickResult.approvalScreenshotPath, String(meta?.approvedPath))
+  check('the approved frame is NOT in the model-facing content',
+    imageBlocks.every((block) => block.attachment.attachmentId !== meta.approvedFrame.attachmentId))
+  check('the card projection survives a JSON round trip losslessly',
+    JSON.stringify(JSON.parse(JSON.stringify(meta))) === JSON.stringify(meta))
+
+  // ---- Readability is a separate property from being described -------------------------------
+  //
+  // This is the check that was missing, and its absence shipped a defect: the card was told about
+  // the credential by `result.meta`, so it rendered a caption and then asked the Host for bytes the
+  // Host refused — "screenshot could not be loaded".
+  //
+  // The Host authorizes an attachment read by scanning the Session log for an event whose content
+  // carries that exact reference (`dsh-api-session-controller`: `attachment()` calls
+  // `referencedImage(source.events, attachmentId)`, whose `imageInEvent` scans `data.content`,
+  // `data.message.content` and `data.inserted[].content`, and otherwise answers
+  // `ATTACHMENT_NOT_REFERENCED`). `meta` is none of those positions.
+
+  const previewEvents = eventsOfType(session, 'cua/preview')
+  check('the plugin references the approved frame from its own log-only event',
+    previewEvents.length === 1, `cua/preview events=${previewEvents.length}`)
+  check('that event carries the reference in the position the Host authorizer scans',
+    previewEvents[0]?.data?.content?.[0]?.type === 'image' &&
+      previewEvents[0].data.content[0].attachment?.attachmentId === meta.approvedFrame.attachmentId,
+    JSON.stringify(previewEvents[0]?.data?.content?.[0]?.attachment))
+  check('that event is log-only (no surface metadata, so the model never sees the frame)',
+    previewEvents[0] !== undefined && previewEvents[0].surfaceOp === undefined,
+    `surfaceOp=${String(previewEvents[0]?.surfaceOp)}`)
+  // The shipped approval panel's `conversation.approval.detail` region receives `callId` and
+  // nothing else, so the event has to carry that join key for the panel to find its frame.
+  check('that event carries the tool call id the approval names',
+    previewEvents[0]?.data?.callId === execBase.callId,
+    `callId=${previewEvents[0]?.data?.callId} expected=${execBase.callId}`)
+  check('that event carries the gated action and tool name',
+    previewEvents[0]?.data?.action === 'click' && previewEvents[0]?.data?.toolName === 'browser_act',
+    `action=${previewEvents[0]?.data?.action} toolName=${previewEvents[0]?.data?.toolName}`)
+  check('a real screen produces a credential frame (the blank-screen suppression did not fire)',
+    cuaPreview.broker.decisions.at(-1)?.frameOmitted === null &&
+      cuaPreview.broker.decisions.at(-1)?.frameAdmitted === true,
+    JSON.stringify({
+      frameOmitted: cuaPreview.broker.decisions.at(-1)?.frameOmitted,
+      frameAdmitted: cuaPreview.broker.decisions.at(-1)?.frameAdmitted,
+    }))
+  check('the Host read rule authorizes the approved frame',
+    sessionReferencesImage(session, meta.approvedFrame.attachmentId),
+    meta.approvedFrame.attachmentId)
+  // This harness calls `execute()` directly, so the tool pipeline never appends a `tool/result`
+  // event here. That makes this the exact worst case the defect lived in — the credential has to be
+  // readable on the strength of the plugin's own event alone, with model-facing content that was
+  // never logged. The model-facing frame's readability is checked against the real Host controller
+  // in `examples/run-real-dsh-load.mjs`, where the pipeline does append that event.
+  check('no tool/result event exists here, so the credential stands on its own event',
+    eventsOfType(session, 'tool/result').length === 0,
+    `tool/result events=${eventsOfType(session, 'tool/result').length}`)
+  check('the Host read rule does NOT authorize an unreferenced attachment (control)',
+    !sessionReferencesImage(session, 'sha256:definitely-not-in-this-session'))
+}
+
+// ---- `browser_navigate` must return the page it actually loaded -------------------------------
+//
+// Two defects met in this path. First, the tool used to return a 4,714-byte blank frame because the
+// screenshot was taken BEFORE `page.goto`, so the model saw an empty tab. Second, once the pre- and
+// post-action frames were split, the credential frame of a first navigation was still that same
+// white rectangle — the tab genuinely is blank before the first navigation. The operator's decision
+// was to emit NO credential frame for a blank screen (and no explanatory text either), so this
+// section pins both halves: the blank case omits the frame, and the loaded case still produces one.
+
+console.log('\n--- navigation ---\n')
+
+const navServer = createServer((_request, response) => {
+  response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+  response.end('<!doctype html><html><head><title>CUA navigate page</title></head>' +
+    '<body><h1>NAVIGATED</h1></body></html>')
+})
+await new Promise((done) => navServer.listen(0, '127.0.0.1', done))
+const navUrl = `http://127.0.0.1:${navServer.address().port}/`
+
+try {
+  // A genuine blank baseline from THIS browser at THIS viewport: the defect returned a frame that
+  // was indistinguishable from this. The page is left blank, so the navigate approval is raised
+  // against an empty tab exactly like the real conversation that found the bug.
+  await page.goto('about:blank')
+  const screenState = await browser.screenState()
+  check('the browser reports an unloaded empty tab as blank',
+    screenState.blank === true && screenState.url === 'about:blank', JSON.stringify(screenState))
+  const blank = await browser.screenshotToFile({ directory: artifactsDir, name: 'baseline-blank.png' })
+
+  const navTool = ctx.tools.get('browser_navigate')
+  const navArgs = { url: navUrl }
+  const previewsBefore = eventsOfType(session, 'cua/preview').length
+
+  auditSeen()
+  const navResult = await navTool.execute(
+    navArgs,
+    { ...execBase, callId: brandString('call-cua-acceptance-navigate') },
+  )
+  auditSeen()
+
+  check('navigate raised exactly one approval/asked', askedEvents.length === 1, `count=${askedEvents.length}`)
+  check('navigate raised exactly one approval/decided', decidedEvents.length === 1, `count=${decidedEvents.length}`)
+  check('navigate reports a one-shot grant',
+    navResult.granted === true && navResult.decision === 'allowed-once', `decision=${navResult.decision}`)
+  check('navigate reports the page it actually loaded',
+    navResult.title === 'CUA navigate page' && navResult.url === navUrl,
+    `title="${navResult.title}" url=${navResult.url}`)
+
+  const navContent = navTool.output.render(navArgs, navResult)
+  const navImages = navContent.filter((block) => block.type === 'image')
+  check('navigate model-facing content carries exactly one image',
+    navImages.length === 1, `images=${navImages.length}`)
+  check('the navigate image is the post-navigation attachment',
+    navImages[0]?.attachment?.attachmentId === navResult.image.attachmentId,
+    `${navImages[0]?.attachment?.attachmentId}`)
+
+  const navPng = await readFile(navResult.screenshotPath)
+  check('the returned navigate frame is NOT the blank tab',
+    !navPng.equals(blank.data), `${navPng.byteLength}B vs blank ${blank.data.byteLength}B`)
+
+  // ---- The blank-screen rule --------------------------------------------------------------
+  const navMeta = navTool.output.presentationMeta(navArgs, navResult)
+  check('a blank screen reports no approval-time screenshot path',
+    navResult.approvalScreenshotPath === undefined, String(navResult.approvalScreenshotPath))
+  check('a blank screen hands the card no credential reference',
+    navResult.approvalImage === undefined && navMeta?.approvedFrame === undefined,
+    `approvalImage=${String(navResult.approvalImage)} approvedFrame=${String(navMeta?.approvedFrame)}`)
+  check('a blank screen appends no cua/preview event',
+    eventsOfType(session, 'cua/preview').length === previewsBefore,
+    `before=${previewsBefore} after=${eventsOfType(session, 'cua/preview').length}`)
+  check('the broker records that it omitted the frame because the screen was blank',
+    cuaPreview.broker.decisions.at(-1)?.frameOmitted === 'blank-screen',
+    `frameOmitted=${String(cuaPreview.broker.decisions.at(-1)?.frameOmitted)}`)
+  check('the omission is not reported as a capture failure',
+    cuaPreview.broker.decisions.at(-1)?.captureError === null,
+    `captureError=${String(cuaPreview.broker.decisions.at(-1)?.captureError)}`)
+  check('the navigate card projection still reports the grant',
+    navMeta?.granted === true, JSON.stringify(navMeta))
+
+  // ---- Positive control: the same tool on a loaded screen DOES produce a credential --------
+  auditSeen()
+  const secondNav = await navTool.execute(
+    { url: navUrl },
+    { ...execBase, callId: brandString('call-cua-acceptance-navigate-2') },
+  )
+  auditSeen()
+  check('a loaded screen still produces a credential frame',
+    typeof secondNav.approvalScreenshotPath === 'string' && secondNav.approvalScreenshotPath.length > 0,
+    String(secondNav.approvalScreenshotPath))
+  check('a loaded screen hands the card the credential reference',
+    secondNav.approvalImage !== undefined && secondNav.approvalImage.attachmentId.length > 0,
+    String(secondNav.approvalImage?.attachmentId))
+  check('a loaded screen appends exactly one more cua/preview event',
+    eventsOfType(session, 'cua/preview').length === previewsBefore + 1,
+    `count=${eventsOfType(session, 'cua/preview').length}`)
+  check('the blank-screen suppression did not fire for the loaded screen',
+    cuaPreview.broker.decisions.at(-1)?.frameOmitted === null,
+    `frameOmitted=${String(cuaPreview.broker.decisions.at(-1)?.frameOmitted)}`)
+  check('the second navigate credential is not the blank tab',
+    !(await readFile(secondNav.approvalScreenshotPath)).equals(blank.data),
+    secondNav.approvalScreenshotPath)
+} finally {
+  await new Promise((done) => navServer.close(done))
+}
+
+// ---- The form-submit path, which the task names alongside click ------------------------------
+
+console.log('\n--- form submission ---\n')
+
+await page.setContent(pageHtml)
+auditSeen()
+const submitResult = await tool.execute(
+  { action: 'submit', selector: '#f' },
+  { ...execBase, callId: brandString('call-cua-acceptance-2') },
+)
+auditSeen()
+
+check('a form submit raises its own approval/asked', askedEvents.length === 1,
+  `count=${askedEvents.length}`)
+check('a form submit raises its own approval/decided', decidedEvents.length === 1,
+  `count=${decidedEvents.length}`)
+check('the form submit was approved and ran', submitResult.granted === true,
+  `granted=${submitResult.granted}`)
+const submittedText = await page.$eval('#heading', (el) => el.textContent)
+check('the form submit actually changed the page', submittedText === 'FORM SUBMITTED',
+  `heading="${submittedText}"`)
+check('the form submit carried its own screenshot',
+  typeof submitResult.screenshotPath === 'string' && submitResult.screenshotPath.endsWith('.png'),
+  submitResult.screenshotPath)
+check('two distinct screenshots were captured for two actions',
+  clickResult.screenshotPath !== submitResult.screenshotPath,
+  `${clickResult.screenshotPath} vs ${submitResult.screenshotPath}`)
+
+// ---- `fill` must REPLACE, not append --------------------------------------------------------
+//
+// A real conversation found this appending: the field held "Alice", a second fill wrote "Bob", and
+// the page showed "AliceBob". Selecting-all and typing does not reliably replace a plain text
+// input, so the implementation now clears the field explicitly.
+
+console.log('\n--- fill semantics ---\n')
+
+await page.setContent(`<!doctype html><html><body>
+  <input id="field" type="text" />
+</body></html>`)
+auditSeen()
+const fillFirst = await tool.execute(
+  { action: 'fill', selector: '#field', value: 'Alice' },
+  { ...execBase, callId: brandString('call-cua-acceptance-fill-1') },
+)
+const afterFirst = await page.$eval('#field', (el) => el.value)
+
+auditSeen()
+const fillSecond = await tool.execute(
+  { action: 'fill', selector: '#field', value: 'Bob' },
+  { ...execBase, callId: brandString('call-cua-acceptance-fill-2') },
+)
+const afterSecond = await page.$eval('#field', (el) => el.value)
+
+check('a first fill writes the value', fillFirst.granted === true && afterFirst === 'Alice',
+  `granted=${fillFirst.granted} value="${afterFirst}"`)
+check('a second fill REPLACES the previous value rather than appending',
+  afterSecond === 'Bob', `value="${afterSecond}" (appending would give "AliceBob")`)
+check('the replacement fill still ran under its own approval',
+  fillSecond.granted === true && fillSecond.decision === 'allowed-once',
+  `decision=${fillSecond.decision}`)
+
+// ---- The form-submit path, which the task names alongside click ------------------------------
+
+// ---------------------------------------------------------------------------------------------
+// Fail-closed behaviour — the property both DSH and ZCode insist on.
+// ---------------------------------------------------------------------------------------------
+
+console.log('\n=== Fail-closed behaviour ===\n')
+
+// Replace the answerer with a rejecting one and confirm no action reaches the page.
+const rejectCtx = new Context()
+const rejectHandle = await buildRejectingRuntime(rejectCtx, artifactsDir)
+
+const before = await rejectHandle.browser.snapshot()
+const refused = await rejectHandle.tool.execute(
+  { action: 'submit', selector: '#f' },
+  { agent: rejectHandle.agent, signal: new AbortController().signal },
+)
+const after = await rejectHandle.browser.snapshot()
+
+check('a rejected approval is reported as not granted', refused.granted === false,
+  `decision=${refused.decision}`)
+check('a rejected approval performs no action',
+  before.url === after.url && after.text === before.text,
+  'page unchanged')
+
+{
+  const args = { action: 'submit', selector: '#f' }
+  const refusedContent = rejectHandle.tool.output.render(args, refused)
+  const refusedImages = refusedContent.filter((block) => block.type === 'image')
+  const refusedMeta = rejectHandle.tool.output.presentationMeta(args, refused)
+
+  check('a refusal reports granted:false in the card projection',
+    refusedMeta?.granted === false, JSON.stringify(refusedMeta))
+  check('a refusal carries no separate approved frame',
+    refusedMeta?.approvedFrame === undefined,
+    'the single frame already IS the approval-time state')
+  check('a refusal still hands the model the approval-time frame',
+    refusedImages.length === 1 &&
+      refusedImages[0].attachment.attachmentId === refused.image?.attachmentId,
+    `images=${refusedImages.length}`)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The refusal has to REACH the model, as a refusal.
+// ---------------------------------------------------------------------------------------------
+//
+// The reported failure this section pins down: the user declined, and the model was handed
+// `missing required property "value.approvalImage"` instead of the refusal. It read that as a
+// transient output-validation fault and retried the very action the user had just rejected.
+//
+// Two independent guarantees are checked, because either one alone can regress:
+//   1. the DECLARED output schema must accept a frame-less result, and
+//   2. a real dispatch through the documented pipeline (`ctx.tools.execute`) must come back as a
+//      SUCCESSFUL result whose content states that a human said no, and what to do next.
+
+console.log('\n=== Fail-closed behaviour: the refusal reaches the model ===\n')
+
+{
+  const { validateJsonSchemaValue } = await import('@deepseek-ai/dsh-tools')
+  const { refusalNotice } = await import('../src/action-text.js')
+
+  // (1) The schema. `required: true` on a *property* node means "required in the parent object" in
+  // this DSL (`dsh-tools`' compiler pushes it into the parent's `required` list), so a `required:
+  // true` on the shared image node made `image` AND `approvalImage` mandatory for every result.
+  const actSchema = tool.output.schema
+  const navSchema = ctx.tools.get('browser_navigate').output.schema
+
+  check('the act output schema does not require the optional image fields',
+    !actSchema.required.includes('image') && !actSchema.required.includes('approvalImage'),
+    `required=${JSON.stringify(actSchema.required)}`)
+  check('the navigation output schema does not require the optional image fields',
+    !navSchema.required.includes('image') && !navSchema.required.includes('approvalImage'),
+    `required=${JSON.stringify(navSchema.required)}`)
+
+  const frameLessAct = {
+    action: 'click', selector: '#go', granted: false, decision: 'rejected',
+    url: 'http://127.0.0.1:3097/', screenshotPath: '',
+  }
+  check('a frame-less act result satisfies its declared output schema',
+    validateJsonSchemaValue(actSchema, frameLessAct, 'value').length === 0,
+    JSON.stringify(validateJsonSchemaValue(actSchema, frameLessAct, 'value')))
+
+  const frameLessNav = {
+    url: 'http://127.0.0.1:3097/', title: 'Test', granted: true, decision: 'allowed-once',
+    screenshotPath: '',
+  }
+  check('a frame-less (blank-screen) navigation result satisfies its declared output schema',
+    validateJsonSchemaValue(navSchema, frameLessNav, 'value').length === 0,
+    JSON.stringify(validateJsonSchemaValue(navSchema, frameLessNav, 'value')))
+
+  // (2) The notice itself, for every non-granting outcome and both languages. The shipped gating
+  // path's sentences are quoted verbatim (`the user rejected tool "X"`, `approval for tool "X" was
+  // cancelled`, `tool "X" requires approval, ...`), so a check can assert exactly what the model
+  // can rely on.
+  const SHIPPED = {
+    rejected: 'the user rejected tool "browser_act"',
+    cancelled: 'approval for tool "browser_act" was cancelled',
+    unavailable: 'tool "browser_act" requires approval, but no approval channel is available.',
+  }
+  const STOP = { en: ['Do not retry', 'ask'], zh: ['不要重试', '询问'] }
+
+  for (const language of ['en', 'zh']) {
+    const notices = Object.keys(SHIPPED).map((decision) => refusalNotice({
+      toolName: 'browser_act',
+      decision,
+      language,
+    }))
+
+    check(`a ${language} refusal notice states the shipped sentence for each outcome`,
+      notices.every((notice, index) => notice.includes(SHIPPED[Object.keys(SHIPPED)[index]])),
+      JSON.stringify(notices))
+
+    check(`a ${language} refusal notice tells the model to stop, not retry, and ask the user`,
+      notices.every((notice) => STOP[language].every((phrase) => notice.includes(phrase))),
+      JSON.stringify(notices))
+
+    check(`a ${language} refusal notice names the tool and says the action did not happen`,
+      notices.every((notice) => notice.includes('browser_act') &&
+        notice.includes(language === 'zh' ? '未执行' : 'was NOT performed')),
+      JSON.stringify(notices))
+
+    check(`a ${language} refusal notice carries no file path`,
+      notices.every((notice) => !/\/(?:tmp|home|var)\//u.test(notice)),
+      JSON.stringify(notices))
+  }
+
+  check('the three non-granting outcomes are worded differently',
+    new Set(Object.keys(SHIPPED).map((decision) => refusalNotice({
+      toolName: 'browser_act', decision, language: 'en',
+    }))).size === 3,
+    'rejected / cancelled / unavailable must not read the same')
+
+  // (3) End to end through the pipeline, with the real service: a rejection dispatched like the
+  // agent loop dispatches it. `ctx.tools.execute` is the documented entry that runs the full
+  // pipeline — `tools/pre-execute` → dispatch → `tools/post-execute` → the lossless materialization
+  // and output-schema validation this bug lived in. Calling `tool.execute()` directly (as the
+  // checks above do, to inspect the raw value) skips all of that, which is exactly why the leak
+  // survived a green suite.
+  check('the harness can dispatch through the documented pipeline entry',
+    typeof ctx.tools.execute === 'function', typeof ctx.tools.execute)
+
+  const refusalCallId = brandString('call-forced-refusal')
+  const disposeForcedRejection = ctx.on('approval/request', async (req, next) => (
+    req.callId === refusalCallId ? 'rejected' : await next()
+  ), { prepend: true })
+
+  const mainBefore = await browser.snapshot()
+  const dispatched = await ctx.tools.execute({
+    callId: refusalCallId,
+    name: 'browser_act',
+    arguments: { action: 'click', selector: '#click-target' },
+    agent,
+    signal: new AbortController().signal,
+  })
+  if (typeof disposeForcedRejection === 'function') disposeForcedRejection()
+  const mainAfter = await browser.snapshot()
+
+  const dispatchedText = dispatched.content
+    .filter((block) => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n')
+
+  check('a refused dispatch is not an error result',
+    dispatched.isError === false, `isError=${dispatched.isError} content=${JSON.stringify(dispatchedText)}`)
+  check('the dispatched refusal tells the model the user rejected the tool',
+    dispatchedText.includes('the user rejected tool "browser_act"'), JSON.stringify(dispatchedText))
+  check('the dispatched refusal tells the model not to retry and to ask the user',
+    dispatchedText.includes('Do not retry') && dispatchedText.includes('ask the user'),
+    JSON.stringify(dispatchedText))
+  check('the dispatched refusal still carries the approval-time frame',
+    dispatched.content.some((block) => block.type === 'image'),
+    JSON.stringify(dispatched.content.map((block) => block.type)))
+  check('a refused dispatch performs no action',
+    mainBefore.url === mainAfter.url && mainBefore.text === mainAfter.text,
+    'page unchanged')
+}
+
+// ---------------------------------------------------------------------------------------------
+// The approval sentence: wording, element naming and language
+// ---------------------------------------------------------------------------------------------
+//
+// `reason` is the whole consent text of the card whenever the asked tool has no `command` argument
+// to preview: `dsh-client-ui-approval` renders `pending.reason` as the headline and the correlated
+// call's `command` (absent for a browser tool) below it. Two rounds of operator feedback produced
+// the current shape — the sentence used to be a DOM dump ("Type into #name-input — a
+// <input type="text">"), and it was fixed to English while the panel chrome is localised. It is now
+// written for a reader, names the target the way the page names it, quotes the text a `fill` will
+// write, and follows the DSH user-settings locale (`locale.preference`) with English as the
+// fallback. These checks drive the real tool against a real page; only the settings service is a
+// facade, because this harness composes no `dsh-settings` provider.
+
+console.log('\n--- approval sentence: wording and language ---\n')
+
+{
+  await page.setContent(`<!doctype html><html lang="zh"><body>
+    <form id="zh-form" onsubmit="event.preventDefault()">
+      <input id="zh-name" name="name" type="text" placeholder="在这里输入一个名字" />
+      <input id="zh-bare" type="text" />
+      <button id="zh-go" type="submit">提交表单</button>
+    </form>
+    <button id="zh-click" type="button">点我</button>
+  </body></html>`)
+
+  const named = await browser.describe('#zh-name')
+  const bare = await browser.describe('#zh-bare')
+  const labelled = await browser.describe('#zh-click')
+  const form = await browser.describe('#zh-form')
+
+  check('describe() names a field by its placeholder',
+    named?.label === '在这里输入一个名字', JSON.stringify(named?.label))
+  check('describe() names a button by its visible text',
+    labelled?.label === '点我', JSON.stringify(labelled?.label))
+  check('describe() reports a field\'s enclosing form',
+    named?.form?.id === 'zh-form', JSON.stringify(named?.form))
+  check('describe() reads a form element as its own enclosing form',
+    form?.form?.id === 'zh-form', JSON.stringify(form?.form))
+  check('describe() reports no label for an element that has none',
+    bare?.label === '', JSON.stringify(bare?.label))
+
+  // The Host reads the locale through the documented settings service (`ctx.settings.get(ns)`),
+  // which the web profile mounts (`dsh-settings-file`) with the `locale` namespace registered by
+  // `dsh-client-locale`'s Host half. This facade stands in for that provider.
+  let localePreference
+  const disposeSettings = ctx.provide('settings', {
+    get: (ns) => (ns === 'locale' && localePreference !== undefined ? { preference: localePreference } : undefined),
+  })
+
+  const lastReason = () => eventsOfType(session, 'approval/asked').at(-1)?.data?.reason
+  const runAction = async (args, tag) => {
+    const result = await tool.execute(args, {
+      agent,
+      callId: brandString(`call-lang-${tag}`),
+      signal: new AbortController().signal,
+    })
+    return { result, reason: lastReason() }
+  }
+
+  localePreference = 'zh'
+  const zhClick = await runAction({ action: 'click', selector: '#zh-click' }, 'zh-click')
+  check('a zh locale writes a Chinese sentence naming the button as the page does',
+    zhClick.reason === '点击按钮「点我」（#zh-click）', JSON.stringify(zhClick.reason))
+
+  const zhFill = await runAction({ action: 'fill', selector: '#zh-name', value: 'Alice' }, 'zh-fill')
+  check('a zh fill sentence names the field and quotes the text it will write',
+    zhFill.reason === '在输入框「在这里输入一个名字」（#zh-name）中输入 "Alice"',
+    JSON.stringify(zhFill.reason))
+
+  const zhSubmit = await runAction({ action: 'submit', selector: '#zh-name' }, 'zh-submit')
+  check('a zh submit sentence names the enclosing form',
+    zhSubmit.reason === '提交表单 #zh-form（其中包含 #zh-name）', JSON.stringify(zhSubmit.reason))
+
+  // A refusal follows the same language rule as the sentence, and it is driven through the
+  // documented pipeline entry (`ctx.tools.execute`) so it also exercises the output-schema
+  // validation that used to turn a refusal into `missing required property "value.approvalImage"`.
+  const zhRefusalCallId = brandString('call-lang-refusal')
+  const disposeZhRejection = ctx.on('approval/request', async (req, next) => (
+    req.callId === zhRefusalCallId ? 'rejected' : await next()
+  ), { prepend: true })
+  const zhRefused = await ctx.tools.execute({
+    callId: zhRefusalCallId,
+    name: 'browser_act',
+    arguments: { action: 'click', selector: '#zh-click' },
+    agent,
+    signal: new AbortController().signal,
+  })
+  if (typeof disposeZhRejection === 'function') disposeZhRejection()
+  const zhRefusedText = zhRefused.content
+    .filter((block) => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n')
+
+  check('a zh locale writes the refusal in Chinese and keeps the shipped sentence verbatim',
+    zhRefused.isError === false &&
+      zhRefusedText.includes('the user rejected tool "browser_act"') &&
+      zhRefusedText.includes('未执行') &&
+      zhRefusedText.includes('不要重试') &&
+      zhRefusedText.includes('询问用户'),
+    JSON.stringify(zhRefusedText))
+
+  localePreference = 'zh-CN'
+  const zhRegion = await runAction({ action: 'click', selector: '#zh-click' }, 'zh-region')
+  check('a regional zh tag (zh-CN) is still Chinese',
+    zhRegion.reason === '点击按钮「点我」（#zh-click）', JSON.stringify(zhRegion.reason))
+
+  localePreference = 'ja'
+  const jaClick = await runAction({ action: 'click', selector: '#zh-click' }, 'ja-click')
+  check('a locale this plugin cannot write falls back to English',
+    jaClick.reason === 'Click the button "点我" (#zh-click)', JSON.stringify(jaClick.reason))
+
+  localePreference = undefined
+  const fallbackClick = await runAction({ action: 'click', selector: '#zh-click' }, 'fallback-click')
+  check('an unset preference falls back to English',
+    fallbackClick.reason === 'Click the button "点我" (#zh-click)', JSON.stringify(fallbackClick.reason))
+
+  const bareFill = await runAction({ action: 'fill', selector: '#zh-bare', value: 'Alice' }, 'bare-fill')
+  check('an element with no name falls back to its DOM shape, never to a wrong label',
+    bareFill.reason === 'Type "Alice" into #zh-bare (a <input type="text">)',
+    JSON.stringify(bareFill.reason))
+
+  const longFill = await runAction({ action: 'fill', selector: '#zh-bare', value: 'x'.repeat(45) }, 'long-fill')
+  check('a long fill value is truncated to 40 characters with an ellipsis',
+    typeof longFill.reason === 'string' &&
+      longFill.reason.includes(`"${'x'.repeat(40)}…"`) && !longFill.reason.includes('x'.repeat(41)),
+    JSON.stringify(longFill.reason))
+
+  disposeSettings()
+}
+
+// Teardown runs here, not before the section above: the sentence is produced by the real tool
+// driving the real browser, so both have to still be alive while it is checked.
+await ctx.loader.stop?.()
+await browser.close()
+await rejectHandle.dispose()
+
+// ---------------------------------------------------------------------------------------------
+
+const { writeFile } = await import('node:fs/promises')
+const reportPath = join(artifactsDir, 'acceptance-report.json')
+await writeFile(reportPath, JSON.stringify({ ...report, artifactsDir }, null, 2))
+
+console.log(`\n=== ${report.failed === 0 ? 'ALL CHECKS PASSED' : `${report.failed} CHECK(S) FAILED`} ===`)
+console.log(`artifacts: ${artifactsDir}`)
+console.log(`report:    ${reportPath}`)
+
+process.exit(report.failed === 0 ? 0 : 1)
+
+// ---------------------------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Every event of one type in the Session log.
+ *
+ * @param session - the live Session.
+ * @param type - the event type to collect.
+ * @returns the matching events, in seq order.
+ */
+function eventsOfType(session, type) {
+  const out = []
+  for (let seq = 0; seq < session.seq; seq += 1) {
+    const event = session.eventAt(seq)
+    if (event?.type === type) out.push(event)
+  }
+  return out
+}
+
+/**
+ * Replicate the Host's attachment-read authorization over a Session log.
+ *
+ * The Client's image loader reaches `dsh-api-session-controller`'s `attachment()`, which refuses
+ * with `session/attachment-invalid` / `ATTACHMENT_NOT_REFERENCED` unless the Session log references
+ * the attachment. This mirrors that predicate so the harness can prove a frame the card renders is
+ * actually readable — the property whose absence produced "screenshot could not be loaded".
+ *
+ * It scans the positions a tool result and a plugin-owned event can occupy. It deliberately omits
+ * the Host's assistant-stream arm, so this is a SUBSET of the Host's scan: passing here implies the
+ * Host's fuller scan passes, never the other way round.
+ *
+ * @param session - the live Session.
+ * @param attachmentId - the attachment to look for.
+ * @returns whether the Host would authorize reading it.
+ */
+function sessionReferencesImage(session, attachmentId) {
+  const blockMatches = (content) => {
+    if (!Array.isArray(content)) return false
+    for (const value of content) {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) continue
+      if (value.type === 'image' && value.attachment !== null && typeof value.attachment === 'object') {
+        if (String(value.attachment.attachmentId) === attachmentId) return true
+      }
+      if (value.type === 'tool-result' && blockMatches(value.content)) return true
+    }
+    return false
+  }
+  for (let seq = 0; seq < session.seq; seq += 1) {
+    const event = session.eventAt(seq)
+    if (event === undefined) continue
+    const data = event.data
+    if (blockMatches(data?.content)) return true
+    if (blockMatches(data?.message?.content)) return true
+    for (const inserted of data?.inserted ?? []) {
+      if (blockMatches(inserted?.content)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Create a live agent whose session has an open turn, using the real session service.
+ *
+ * The approval seam requires turn enclosure, and a turn exists only under a real agent, so
+ * this builds the smallest honest one rather than faking the check.
+ */
+async function makeAgentWithOpenTurn(context, sessionId) {
+  const { SessionId } = await import('@deepseek-ai/dsh-session')
+  const session = context.sessions.create(SessionId(sessionId))
+  session.append('turn/start', { turn: 1 })
+  const agent = { session, id: sessionId }
+  // `ctx.approval.request` reads `req.agent.session`; the session must be committed by now.
+  return agent
+}
+
+/** Build a second, independent runtime whose answerer rejects every request. */
+async function buildRejectingRuntime(context, dir) {
+  const { default: SystemPrompt } = await import('@deepseek-ai/dsh-system-prompt')
+  const { default: Tools } = await import('@deepseek-ai/dsh-tools')
+  const { default: Approval } = await import('@deepseek-ai/dsh-user-approval')
+  const { default: AttachmentLocal } = await import('@deepseek-ai/dsh-attachment-local')
+  const { default: SessionService } = await import('@deepseek-ai/dsh-session')
+
+  await context.plugin(SystemPrompt)
+  await context.plugin(SessionService)
+  await context.plugin(Tools)
+  await context.plugin(AttachmentLocal, { root: join(dir, 'attachments-2') })
+  await context.plugin(Approval, { policy: 'ask' })
+  await context.plugin({ name: 'reject-answerer', apply: (c) => { c.on('approval/request', async () => 'rejected') } })
+
+  const { apply, name, inject } = await import('../src/index.js')
+  // Keep this copy inside the run's own artifact directory rather than the operator's default one.
+  await context.plugin({ name, apply, inject }, { artifactsDir: dir, headless: true })
+
+  const { brandString } = await import('@deepseek-ai/dsh-brand')
+  const { SessionId } = await import('@deepseek-ai/dsh-session')
+  const session = context.sessions.create(SessionId(brandString(`cua-reject-${Date.now()}`)))
+  session.append('turn/start', { turn: 1 })
+  const agent = { session, id: 'reject-agent' }
+
+  // The MOST RECENT instance: this runtime mounts a second copy of the plugin, and its tools drive
+  // its own browser. Selecting by artifacts directory would pick the first copy (both share this
+  // run's directory) and the assertions would silently read a different browser than the tool used.
+  const cuaPreview = cuaPreviewOf()
+  const page = await cuaPreview.browser.page()
+  await page.setContent(`<!doctype html><html><body><h1>Reject probe</h1>
+    <form id="f" onsubmit="event.preventDefault();document.body.innerHTML='SUBMITTED'">
+      <input id="q" type="text" /><button id="go" type="submit">Go</button></form></body></html>`)
+
+  return {
+    browser: cuaPreview.browser,
+    tool: context.tools.get('browser_act'),
+    agent,
+    dispose: async () => { await context.stop?.() },
+  }
+}

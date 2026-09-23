@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUA 本地测试页</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --line: #2a2f3a;
+    --text: #e6e9ef;
+    --muted: #98a1b3;
+    --idle: #3a4150;
+    --ok: #1f8f4e;
+    --info: #2563c9;
+    --warn: #b4530a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC", sans-serif;
+  }
+  h1 { margin: 0 0 4px; font-size: 34px; letter-spacing: -0.5px; }
+  .sub { color: var(--muted); margin-bottom: 28px; font-size: 15px; }
+
+  /* The status banner is the primary visual signal: it changes colour and wording for every
+     action, so a screenshot taken before an action and one taken after are unmistakably
+     different. */
+  #status {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 22px 26px;
+    border-radius: 14px;
+    background: var(--idle);
+    border: 1px solid rgba(255,255,255,.08);
+    font-size: 26px;
+    font-weight: 650;
+    margin-bottom: 30px;
+    transition: background .18s ease;
+  }
+  #status[data-state="clicked"] { background: var(--ok); }
+  #status[data-state="typed"]   { background: var(--info); }
+  #status[data-state="submitted"] { background: var(--info); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 22px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px;
+  }
+  .card h2 { margin: 0 0 6px; font-size: 17px; }
+  .card p { color: var(--muted); font-size: 14px; margin: 0 0 16px; }
+  code {
+    background: #0b0d11; border: 1px solid var(--line); border-radius: 6px;
+    padding: 1px 6px; font-size: 13px; color: #b9c6ff;
+  }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer;
+    padding: 12px 22px; border-radius: 10px; border: 0;
+    background: #e6e9ef; color: #0f1115;
+  }
+  button:hover { background: #fff; }
+  input {
+    font: inherit; padding: 11px 14px; border-radius: 10px;
+    border: 1px solid var(--line); background: #0b0d11; color: var(--text);
+    width: 100%; margin-bottom: 12px;
+  }
+  input:focus { outline: 2px solid #3b6fd4; border-color: transparent; }
+
+  #log { margin-top: 30px; }
+  #log h2 { font-size: 15px; color: var(--muted); font-weight: 600; }
+  #log ol { margin: 8px 0 0; padding-left: 22px; color: var(--muted); font-size: 14px; }
+  #log li { margin-bottom: 4px; }
+  #log li:last-child { color: var(--text); }
+
+  #page-marker {
+    position: fixed; right: 24px; bottom: 20px;
+    color: #4b5567; font-size: 12px; letter-spacing: .08em;
+  }
+</style>
+</head>
+<body>
+
+<h1>CUA 本地测试页</h1>
+<div class="sub">
+  稳定的本地目标，供 <code>browser_act</code> 的点击与表单提交使用。每次动作都会让顶部横幅**大幅变色**，
+  这样「审批时的截图」与「动作后的截图」对比一目了然。
+</div>
+
+<div id="status" data-state="initial">⬜ 初始状态 — 尚未执行任何操作</div>
+
+<div class="grid">
+  <section class="card">
+    <h2>1. 点击测试</h2>
+    <p>目标选择器：<code>#click-target</code></p>
+    <button id="click-target" type="button">点我</button>
+  </section>
+
+  <section class="card">
+    <h2>2. 表单测试</h2>
+    <p>输入框：<code>#name-input</code> · 提交按钮：<code>#submit-button</code> · 表单：<code>#demo-form</code></p>
+    <form id="demo-form" autocomplete="off">
+      <input id="name-input" name="name" type="text" placeholder="在这里输入一个名字">
+      <button id="submit-button" type="submit">提交表单</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>3. 输入测试</h2>
+    <p>目标选择器：<code>#name-input</code>（用 <code>fill</code> 写入，不提交）</p>
+    <button id="fill-probe" type="button">检查输入框当前内容</button>
+  </section>
+</div>
+
+<div id="log">
+  <h2>操作历史</h2>
+  <ol id="actions"><li>（暂无）</li></ol>
+</div>
+
+<div id="page-marker">LOCAL TEST PAGE</div>
+
+<script>
+  // Every handler does three things: repaint the banner, append to the visible history, and stamp
+  // a data attribute that browser_snapshot can read back as text.
+  const status = document.getElementById('status');
+  const actions = document.getElementById('actions');
+
+  function record(text) {
+    if (actions.children.length === 1 && actions.children[0].textContent === '（暂无）') {
+      actions.removeChild(actions.children[0]);
+    }
+    const li = document.createElement('li');
+    li.textContent = text;
+    actions.appendChild(li);
+  }
+
+  function paint(state, message) {
+    status.dataset.state = state;
+    status.textContent = message;
+  }
+
+  document.getElementById('click-target').addEventListener('click', () => {
+    paint('clicked', '✅ 按钮已点击 — CLICK SUCCEEDED');
+    record('点击了 #click-target');
+  });
+
+  document.getElementById('name-input').addEventListener('input', () => {
+    paint('typed', '✏️ 输入框内容：' + document.getElementById('name-input').value);
+  });
+
+  document.getElementById('fill-probe').addEventListener('click', () => {
+    const value = document.getElementById('name-input').value;
+    paint('typed', '✏️ 输入框当前内容：' + (value === '' ? '(空)' : value));
+    record('检查输入框：' + (value === '' ? '(空)' : value));
+  });
+
+  document.getElementById('demo-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const name = document.getElementById('name-input').value || '(未填写)';
+    paint('submitted', '✅ 表单已提交 — FORM SUBMITTED：' + name);
+    record('提交了 #demo-form，name=' + name);
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Packed tarballs
+*.tgz
+*.tar.gz
+
+# Build and coverage output
+dist/
+build/
+coverage/
+
+# Logs and debug output
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+
+# Local configuration and secrets (never commit these)
+.env
+.env.*
+!.env.example
+*.local
+.npmrc
+.yarnrc
+.yarnrc.yml
+
+# Editor and IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating system
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+.cache/
+tmp/
+
+# Screenshot artifacts written by the plugin during a local run
+artifacts/

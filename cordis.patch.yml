@@ -1,0 +1,7 @@
+# dsh-cua-preview overlay: insert the plugin into any profile.
+#
+# Layer ordering (docs/user/develop/basic/publish.md):
+# a `--patch` overlay is applied after every bundle layer, so this row wins.
+- insert:
+    - id: cua-preview
+      name: 'dsh-cua-preview'

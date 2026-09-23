@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch cancels tasks still running for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The gate. This job runs only what is reproducible without a browser: the Client-bundle verifier
+  # and the packaging check. Everything the plugin needs there comes from `npm ci`.
+  client:
+    name: client bundle + packaging (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `engines` declares >=22.12.0; this covers that floor and the current LTS.
+        node: ['22', '24']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # `ci` rather than `install`: it honours package-lock.json and never rewrites it.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify the client bundle
+        run: npm run test:client
+
+      # Proves the published file set is exactly what `files` declares.
+      - name: Verify packaging
+        run: npm pack --dry-run
+
+  # Relative links in the documentation must resolve, because the docs cross-reference each other and
+  # the source comments point at them. No extra lint dependency is introduced for this.
+  links:
+    name: documentation link targets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Only one thing is checked: a relative link from a Markdown file in this repository must point
+      # at a file that exists. Content inside fenced code blocks is not a link, so the fences are
+      # stripped first. A block scalar is required because the script contains ": " (colon plus
+      # space), which a plain YAML scalar cannot hold.
+      - name: Verify relative links resolve
+        run: |
+          node -e '
+          const { readFileSync, existsSync, readdirSync } = require("node:fs");
+          const { dirname, resolve, join } = require("node:path");
+          const stripFences = (text) => text.replace(/^```[\s\S]*?^```$/gm, "");
+          const files = ["README.md", "README.zh.md", "CHANGELOG.md", ...readdirSync("docs").filter((f) => f.endsWith(".md")).map((f) => join("docs", f))];
+          let bad = 0;
+          for (const file of files) {
+            const text = stripFences(readFileSync(file, "utf8"));
+            for (const m of text.matchAll(/\]\((?!https?:|#|mailto:)([^)#]+)/g)) {
+              const target = resolve(dirname(file), m[1]);
+              if (!existsSync(target)) {
+                console.error(file + ": broken relative link -> " + m[1]);
+                bad++;
+              }
+            }
+          }
+          process.exit(bad === 0 ? 0 : 1);
+          '
+
+  # The full suite needs a Chrome executable and, for the last entry, a `dsh` CLI on PATH. It is
+  # deliberately NOT part of the push/PR gate: it is heavier, it depends on the DSH release train, and
+  # it has not been verified on a GitHub runner. Run it from the Actions tab once, confirm it is green
+  # on this runner, then promote it into the default gate if you want it enforced.
+  full-suite:
+    name: full suite incl. browser (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The browser suites use the Chrome that is already on the runner, so nothing is downloaded here.
+      - name: Report the Chrome the plugin will find
+        run: ls -l /usr/bin/google-chrome-stable /usr/bin/chromium 2>/dev/null || echo "no system Chrome found"
+
+      - name: Acceptance suite (real DSH services, real Chrome)
+        run: npm run test:acceptance
+
+      - name: Install the dsh CLI for the real-process probe
+        run: npm install --global @deepseek-ai/dsh@0.1.5-rc.3
+
+      - name: Real-process probe (boots the shipped dsh binary)
+        run: npm run test:real-load
