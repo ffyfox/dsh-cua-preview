@@ -170,6 +170,40 @@ the typed text was appended instead of replacing. The old code comment asserted 
 the behaviour, which made the bug harder to see; the current comment describes what happens, and a
 check pins `"Alice"` then `"Bob"` → `"Bob"`.
 
+### Waiting for the page to react
+
+"After the action" used to mean "after `page.click()` returned", which is the wrong instant. Puppeteer's
+`click` resolves once the input event is dispatched and does not wait for anything the page does with
+it, and `goto` with `domcontentloaded` resolves before a JS-rendered page has rendered anything. The
+consequence was measured against a fixture whose own reaction takes 900 ms: the frame the user was
+asked to judge was written **64 ms** after the action and still read `PENDING`.
+
+`BrowserController.settle` now runs between the action and the post-action capture:
+
+1. **grace (250 ms)** — a reaction scheduled on a timer has not started when the action returns, so
+   "nothing has changed yet" must not read as "already finished".
+2. **network quiet (400 ms)** — `page.waitForNetworkIdle`. One detail matters and is easy to get wrong:
+   puppeteer's inflight count decrements when a response's **headers** arrive, not only when the request
+   finishes (`api/Page.js` subscribes to `requestfailed`, `requestfinished` **and** `response`). So this
+   condition catches a request still *awaiting a response* — a slow server — and does **not** stay busy
+   for a response body that is still streaming. A fixture built as an endless chunked stream therefore
+   does not exercise it; the acceptance check uses an endpoint that never answers at all.
+3. **DOM stable (400 ms)** — a fingerprint of `location.href`, `document.title`, the element count and an
+   FNV-1a hash of `body.textContent`, sampled every 150 ms and required to repeat. `textContent` rather
+   than `innerText` avoids forcing layout on every poll, and the hash is what catches an in-place change
+   that keeps the same length.
+
+The network condition is checked first and the DOM condition only once it holds: a page that is still
+waiting for an answer is still working, so its DOM would not be settled anyway. Both conditions and the
+whole wait are bounded by `capMs`, because a stream, a long-poll or an animation loop can keep a page
+busy forever, and a tool call must not hang on one.
+
+The budget is why `settled: false` exists. A heuristic cannot promise a frame is final, so the result
+says which condition never held (`networkBusy`) and the model-facing text says the frame may be
+mid-update. The alternative — silently returning a possibly-stale frame while the tool description
+promises "the action's effect" — is a claim the plugin cannot support. Setting `settle: false` skips the
+wait entirely and reports **no** `settled` field at all, for the same reason.
+
 ### A blank screen emits no frame
 
 The credential frame of a *first* navigation is genuinely a blank tab — 1,280×800, 4,714 bytes, md5

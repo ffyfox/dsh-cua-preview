@@ -674,6 +674,211 @@ check('the replacement fill still ran under its own approval',
 // ---- The form-submit path, which the task names alongside click ------------------------------
 
 // ---------------------------------------------------------------------------------------------
+// The post-action frame must be the page's REACTION, not the state the action started from.
+// ---------------------------------------------------------------------------------------------
+//
+// The failure this section pins down, measured on a page whose own reaction takes 900 ms:
+// `page.click()` returned after 23 ms and the frame was captured 64 ms in, so the image the user
+// was asked to judge still read `PENDING` — the page had not reacted yet.
+//
+// `examples/test-page/slow.html` is that page as a fixture. This section takes two references
+// directly from the same browser — what a no-wait capture shows (the old behaviour) and what the
+// settled page shows — and then requires the TOOL's frame to be the second and not the first.
+
+console.log('\n--- post-action settle ---\n')
+
+const slowPageHtml = await readFile(join(import.meta.dirname, 'test-page/slow.html'), 'utf8')
+
+const settleServer = createServer((request, response) => {
+  const path = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
+  if (path === '/never') {
+    // Never answer at all — not even the headers. Puppeteer's inflight accounting decrements as soon
+    // as a response's HEADERS arrive (`api/Page.js`: on `requestfailed`, `requestfinished`, or
+    // `response`), so a slow BODY does not keep a page busy; only a request still awaiting a
+    // response does. A request awaiting a response forever is therefore the case that makes the
+    // "network went quiet" condition unreachable, which is what the budget exists to bound.
+    request.on('close', () => response.destroy())
+    return
+  }
+  if (path === '/stream-page') {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    response.end('<!doctype html><html><head><title>CUA stream page</title></head><body>' +
+      '<h1 id="head">STREAM</h1><button id="go" type="button">go</button>' +
+      '<script>fetch("/never").catch(() => {})</script></body></html>')
+    return
+  }
+  response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+  response.end(slowPageHtml)
+})
+await new Promise((done) => settleServer.listen(0, '127.0.0.1', done))
+const settleBase = `http://127.0.0.1:${settleServer.address().port}`
+const slowUrl = `${settleBase}/slow.html`
+const settleNavTool = ctx.tools.get('browser_navigate')
+
+// ---- The config surface, before anything touches a browser -----------------------------------
+//
+// `settle` is new public configuration, so the parsing rules are pinned here rather than assumed:
+// the documented default, the disable switch, the shorthand number, the partial object, and the
+// refusal of everything else (logged and replaced, never thrown — a wrong timer must not stop the
+// plugin from loading).
+{
+  const { settleOptionsOf } = await import('../src/index.js')
+  const DEFAULTS = { graceMs: 250, idleMs: 400, capMs: 3000 }
+  const required = tool.output.schema.required
+
+  check('the settle fields are optional in the declared output schema',
+    !required.includes('settled') && !required.includes('settleMs') && !required.includes('networkBusy'),
+    `required=${JSON.stringify(required)}`)
+  check('an omitted settle config is the documented default',
+    JSON.stringify(settleOptionsOf({})) === JSON.stringify(DEFAULTS), JSON.stringify(settleOptionsOf({})))
+  check('settle: false disables the wait entirely',
+    settleOptionsOf({ settle: false }) === null, String(settleOptionsOf({ settle: false })))
+  check('a number is the total budget with the other two values defaulted',
+    JSON.stringify(settleOptionsOf({ settle: 1200 })) === JSON.stringify({ ...DEFAULTS, capMs: 1200 }),
+    JSON.stringify(settleOptionsOf({ settle: 1200 })))
+  check('an object overrides only the fields it names',
+    JSON.stringify(settleOptionsOf({ settle: { graceMs: 0, capMs: 500 } })) ===
+      JSON.stringify({ graceMs: 0, idleMs: 400, capMs: 500 }),
+    JSON.stringify(settleOptionsOf({ settle: { graceMs: 0, capMs: 500 } })))
+
+  const warnings = []
+  const refused = ['yes', true, -1, null].map((value) => (
+    settleOptionsOf({ settle: value }, { warn: (message) => warnings.push(message) })
+  ))
+  check('an unusable settle value is refused, logged, and replaced by the defaults',
+    refused.every((budget) => JSON.stringify(budget) === JSON.stringify(DEFAULTS)) && warnings.length === 4,
+    `warnings=${warnings.length}`)
+}
+
+try {
+  // ---- References, from the controller, bypassing the tool entirely --------------------------
+  await page.goto('about:blank')
+  await browser.navigate(slowUrl)
+  const navImmediate = await browser.screenshotToFile({ directory: artifactsDir, name: 'settle-ref-nav-immediate.png' })
+  await new Promise((resolve) => setTimeout(resolve, 1500))
+  const navSettled = await browser.screenshotToFile({ directory: artifactsDir, name: 'settle-ref-nav-settled.png' })
+
+  check('the fixture really does react late (its immediate frame is not its settled frame)',
+    !navImmediate.data.equals(navSettled.data),
+    `immediate=${navImmediate.data.byteLength}B settled=${navSettled.data.byteLength}B`)
+
+  // ---- navigate: the tool's frame must be the reaction ----------------------------------------
+  auditSeen()
+  const settleNav = await settleNavTool.execute(
+    { url: slowUrl },
+    { ...execBase, callId: brandString('call-cua-acceptance-settle-nav') },
+  )
+  auditSeen()
+  const settleNavPng = await readFile(settleNav.screenshotPath)
+
+  check('navigate waits for the page to react before capturing',
+    settleNavPng.equals(navSettled.data), `${settleNavPng.byteLength}B vs settled ${navSettled.data.byteLength}B`)
+  check('navigate no longer captures the pre-reaction state',
+    !settleNavPng.equals(navImmediate.data),
+    `${settleNavPng.byteLength}B vs immediate ${navImmediate.data.byteLength}B`)
+  check('navigate reports the page as settled', settleNav.settled === true, `settled=${String(settleNav.settled)}`)
+  check('navigate reports a wait inside the configured budget',
+    typeof settleNav.settleMs === 'number' && settleNav.settleMs >= 1000 && settleNav.settleMs <= 3000,
+    `settleMs=${String(settleNav.settleMs)}`)
+  check('a settled frame adds no "may be mid-update" line',
+    !settleNavTool.output.render({ url: slowUrl }, settleNav).find((b) => b.type === 'text').text
+      .includes('settled: false'),
+    'no note expected on a settled frame')
+
+  // ---- click: the same property for the reaction that follows an ACTION -----------------------
+  await page.goto('about:blank')
+  await browser.navigate(slowUrl)
+  await browser.click('#slow-go')
+  const clickImmediate = await browser.screenshotToFile({ directory: artifactsDir, name: 'settle-ref-click-immediate.png' })
+  await new Promise((resolve) => setTimeout(resolve, 1500))
+  const clickSettled = await browser.screenshotToFile({ directory: artifactsDir, name: 'settle-ref-click-settled.png' })
+
+  check('the click fixture reacts late too',
+    !clickImmediate.data.equals(clickSettled.data),
+    `immediate=${clickImmediate.data.byteLength}B settled=${clickSettled.data.byteLength}B`)
+
+  await page.goto('about:blank')
+  await browser.navigate(slowUrl)
+  auditSeen()
+  const settleClick = await tool.execute(
+    { action: 'click', selector: '#slow-go' },
+    { ...execBase, callId: brandString('call-cua-acceptance-settle-click') },
+  )
+  auditSeen()
+  const settleClickPng = await readFile(settleClick.screenshotPath)
+
+  check('a click waits for the page to react before capturing',
+    settleClickPng.equals(clickSettled.data),
+    `${settleClickPng.byteLength}B vs settled ${clickSettled.data.byteLength}B`)
+  check('a click no longer captures the pre-reaction state',
+    !settleClickPng.equals(clickImmediate.data),
+    `${settleClickPng.byteLength}B vs immediate ${clickImmediate.data.byteLength}B`)
+  check('a click reports the page as settled',
+    settleClick.settled === true && settleClick.settleMs >= 1000,
+    `settled=${String(settleClick.settled)} settleMs=${String(settleClick.settleMs)}`)
+
+  // The shape a disabled wait produces: no settle fields at all. It has to satisfy the same declared
+  // schema, or `settle: false` would turn every granted action into an output-validation failure.
+  {
+    const { validateJsonSchemaValue } = await import('@deepseek-ai/dsh-tools')
+    const withoutSettle = { ...settleClick }
+    delete withoutSettle.settled
+    delete withoutSettle.settleMs
+    delete withoutSettle.networkBusy
+    check('a granted result with the wait disabled (no settle fields) satisfies the schema',
+      validateJsonSchemaValue(tool.output.schema, withoutSettle, 'value').length === 0,
+      JSON.stringify(validateJsonSchemaValue(tool.output.schema, withoutSettle, 'value')))
+  }
+
+
+  // ---- A page that never goes quiet: bounded wait, and the result says so ---------------------
+  //
+  // `settled: false` is the honest half of the design. The wait is a heuristic with a budget, so it
+  // cannot promise the frame is final; what it CAN promise is that it never claims more than it
+  // verified, and that a page which never quiesces costs the budget once rather than stalling.
+  await page.goto('about:blank')
+  await browser.navigate(`${settleBase}/stream-page`)
+  const streamStarted = Date.now()
+  auditSeen()
+  const settleStream = await tool.execute(
+    { action: 'click', selector: '#go' },
+    { ...execBase, callId: brandString('call-cua-acceptance-settle-stream') },
+  )
+  auditSeen()
+  const streamElapsed = Date.now() - streamStarted
+
+  check('a never-quiet page still performs the action',
+    settleStream.granted === true, `granted=${String(settleStream.granted)}`)
+  check('a never-quiet page is reported as NOT settled',
+    settleStream.settled === false, `settled=${String(settleStream.settled)}`)
+  check('the report names the network as the condition that never held',
+    settleStream.networkBusy === true, `networkBusy=${String(settleStream.networkBusy)}`)
+  check('the wait is bounded by the configured budget',
+    streamElapsed >= 3000 && streamElapsed <= 4500, `elapsed=${streamElapsed}ms`)
+  check('the unusable frame is still returned, with a path on disk',
+    typeof settleStream.screenshotPath === 'string' && settleStream.screenshotPath.endsWith('.png'),
+    settleStream.screenshotPath)
+  {
+    const text = tool.output.render({ action: 'click', selector: '#go' }, settleStream)
+      .find((block) => block.type === 'text').text
+    check('the model is told the frame may be mid-update',
+      text.includes('settled: false') && text.includes('may be mid-update'), JSON.stringify(text))
+    const images = tool.output.render({ action: 'click', selector: '#go' }, settleStream)
+      .filter((block) => block.type === 'image')
+    check('the frames are still handed to the model as images, the approved one first',
+      images.length === 2 &&
+        images[0].attachment.attachmentId === settleStream.approvalImage?.attachmentId &&
+        images[1].attachment.attachmentId === settleStream.image?.attachmentId,
+      `images=${images.length}`)
+  }
+} finally {
+  // The unanswered `/never` request holds its socket open, so the server must be told to drop
+  // connections before `close()` can call back.
+  settleServer.closeAllConnections()
+  await new Promise((done) => settleServer.close(done))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Fail-closed behaviour — the property both DSH and ZCode insist on.
 // ---------------------------------------------------------------------------------------------
 

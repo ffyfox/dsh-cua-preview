@@ -43,6 +43,18 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   is deliberately **not** a declared dependency, so the route attaches through `ctx.inject` when that
   service appears — a one-shot `ctx.get('connection')` inside `apply` was measured to lose that race in the
   real web profile, which would have silently disabled the preview in the only profile that has one.
+- **The post-action screenshot now waits for the page to react.** `page.click()` returns the moment the
+  input is dispatched, and `goto` with `domcontentloaded` returns before a JS-rendered page has rendered
+  anything, so the frame used to be the state the action *started* from: measured against a page whose
+  own reaction takes 900 ms, it was written 64 ms in and still read `PENDING`. Every gated action now
+  waits for a grace period, then for the network to go quiet, then for the DOM to stop changing, all
+  bounded by a budget (250/400/3000 ms by default). New `settle` config: `false` skips the wait, a
+  number is the total budget, an object overrides any of the three values; anything else is logged and
+  ignored rather than failing the load.
+- `settled` / `settleMs` / `networkBusy` on a granted `browser_navigate` / `browser_act` result, and a
+  line in the model-facing text when the budget ran out. A heuristic cannot promise a frame is final, so
+  the result says so instead of the plugin claiming more than it verified; with `settle: false` the
+  fields are absent entirely.
 
 ### Changed
 

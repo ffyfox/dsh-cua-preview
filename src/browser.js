@@ -17,6 +17,7 @@
 
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import puppeteer from 'puppeteer-core'
 
 /**
@@ -47,6 +48,29 @@ export const PREVIEW_TEXT_LIMIT = 200
 
 /** Longest edge of a persisted screenshot, in CSS pixels. */
 export const SCREENSHOT_MAX_DIMENSION = 1280
+
+/**
+ * Default budget for the wait between an action and the screenshot that reports it.
+ *
+ * Why a wait exists at all: `page.click()` returns the moment the input is dispatched, and
+ * `goto` with `domcontentloaded` returns before a JS-rendered page has rendered anything. A
+ * capture taken right then is the state the action STARTED from, not the state it produced.
+ * Measured on a page whose own reaction takes 900 ms: the frame used to be captured 64 ms after
+ * the action and still read `PENDING`, so the user reviewing it could not tell what happened.
+ *
+ * `graceMs` is the period we do not believe anyone yet — it covers a reaction that starts on a
+ * timeout rather than synchronously. `idleMs` is how long the page must then stay quiet before we
+ * accept that it has finished. `capMs` bounds the whole wait so a page that never goes quiet
+ * (a long-poll, a stream, an animation loop) cannot stall a tool call.
+ */
+export const SETTLE_DEFAULTS = Object.freeze({
+  graceMs: 250,
+  idleMs: 400,
+  capMs: 3000,
+})
+
+/** How often the DOM signature is sampled while waiting for the page to stop changing. */
+const SETTLE_POLL_MS = 150
 
 export class BrowserUnavailableError extends Error {
   constructor(message) {
@@ -314,6 +338,134 @@ export class BrowserController {
       return (body.textContent ?? '').trim() === ''
     })
     return { url, blank: empty }
+  }
+
+  /**
+   * Wait until the page has stopped changing, so a capture taken afterwards shows what an action
+   * PRODUCED rather than what it started from.
+   *
+   * Two conditions must both hold, and each covers a case the other misses:
+   *
+   * - **The network went quiet.** `page.waitForNetworkIdle` reports no request still awaiting a
+   *   response for `idleMs`. This catches a `fetch`/XHR whose answer has not arrived yet — the case
+   *   where the DOM has not changed *because there is nothing to change it to*. One detail is easy to
+   *   get wrong: puppeteer drops a request from that count as soon as its response HEADERS arrive
+   *   (`api/Page.js` subscribes to `response` as well as `requestfinished`), so a slow response BODY
+   *   does not keep a page busy — a slow server does.
+   * - **The DOM stopped changing.** A cheap signature (URL, title, element count, and a hash of the
+   *   body text) is sampled every {@link SETTLE_POLL_MS} and must stay identical for `idleMs`. This
+   *   catches a reaction that needs no network at all.
+   *
+   * The network condition is checked first and the DOM condition only once it holds: a page that is
+   * still fetching is still working, so its DOM would not be stable anyway. `graceMs` is waited
+   * first, because a reaction scheduled on a timer has not even started when the action returns —
+   * without it, "nothing has changed yet" would read as "already finished".
+   *
+   * The whole wait is bounded by `capMs`, so a page that never goes quiet (a stream, a long-poll, an
+   * animation loop) costs the cap once. That outcome is reported as `settled: false` and carried
+   * into the tool result rather than hidden, because the frame really may be mid-update.
+   *
+   * @param {object} [options] - overrides for this call.
+   * @param {number} [options.graceMs] - period before the page is believed (default 250).
+   * @param {number} [options.idleMs] - how long each condition must hold (default 400).
+   * @param {number} [options.capMs] - total budget for the whole wait (default 3000).
+   * @param {AbortSignal} [options.signal] - cancellation.
+   * @returns {Promise<{settled: boolean, ms: number, networkIdle: boolean}>} the wait's outcome.
+   */
+  async settle({
+    graceMs = SETTLE_DEFAULTS.graceMs,
+    idleMs = SETTLE_DEFAULTS.idleMs,
+    capMs = SETTLE_DEFAULTS.capMs,
+    signal,
+  } = {}) {
+    const started = Date.now()
+    const deadline = started + Math.max(0, capMs)
+    const remaining = () => Math.max(0, deadline - Date.now())
+    signal?.throwIfAborted()
+
+    if (graceMs > 0 && remaining() > 0) await delay(Math.min(graceMs, remaining()), undefined, { signal })
+
+    let networkIdle = false
+    if (remaining() > 0) {
+      try {
+        const page = await this.page()
+        await page.waitForNetworkIdle({ idleTime: idleMs, timeout: remaining() })
+        networkIdle = true
+      } catch {
+        // Advisory by construction: a timeout, or a page that died while waiting, must never fail
+        // the action that already happened. `TimeoutError` is the expected case here.
+        networkIdle = false
+      }
+    }
+
+    let domStable = false
+    if (networkIdle && remaining() > 0) domStable = await this.#domStableFor(idleMs, remaining(), signal)
+
+    return { settled: networkIdle && domStable, ms: Date.now() - started, networkIdle }
+  }
+
+  /**
+   * Whether the DOM signature stayed identical for `idleMs`, within `budget` milliseconds.
+   *
+   * A signature read that throws counts as a change, not as stability: the usual cause is a
+   * navigation tearing down the execution context, which is the opposite of "nothing is happening".
+   *
+   * @param {number} idleMs - how long the signature must hold.
+   * @param {number} budget - milliseconds left for this condition.
+   * @param {AbortSignal} [signal] - cancellation.
+   * @returns {Promise<boolean>} whether the DOM went quiet in time.
+   */
+  async #domStableFor(idleMs, budget, signal) {
+    const deadline = Date.now() + budget
+    let previous
+    let unchangedSince = 0
+    while (Date.now() < deadline) {
+      signal?.throwIfAborted()
+      let signature
+      try {
+        signature = await this.#signature()
+      } catch {
+        signature = `unreadable:${Date.now()}`
+      }
+      if (signature === previous) {
+        if (Date.now() - unchangedSince >= idleMs) return true
+      } else {
+        previous = signature
+        unchangedSince = Date.now()
+      }
+      const left = deadline - Date.now()
+      if (left > 0) await delay(Math.min(SETTLE_POLL_MS, left), undefined, { signal })
+    }
+    return false
+  }
+
+  /**
+   * A cheap fingerprint of the page's rendered state, read inside the page.
+   *
+   * `textContent` rather than `innerText`: it answers the same question without forcing layout on
+   * every poll. The explicit hash is what catches an in-place change that keeps the same length —
+   * a digit becoming another digit, which a length-only signature would read as "no change".
+   *
+   * @returns {Promise<string>} the signature.
+   */
+  async #signature() {
+    const page = await this.page()
+    return page.evaluate(() => {
+      const body = document.body
+      const text = body === null ? '' : (body.textContent ?? '')
+      let hash = 2166136261
+      for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index)
+        hash = Math.imul(hash, 16777619) >>> 0
+      }
+      return [
+        document.location.href,
+        document.title,
+        document.querySelectorAll('*').length,
+        text.length,
+        hash,
+      ].join('|')
+    })
   }
 
   /**

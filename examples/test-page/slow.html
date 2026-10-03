@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUA 延迟反应测试页</title>
+<style>
+  :root { --bg: #0f1115; --panel: #171a21; --line: #2a2f3a; --text: #e6e9ef; --muted: #98a1b3; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC", sans-serif;
+  }
+  h1 { margin: 0 0 10px; font-size: 32px; letter-spacing: -0.5px; }
+  p { color: var(--muted); max-width: 62ch; margin: 0 0 26px; }
+  code { background: #0b0d11; border: 1px solid var(--line); border-radius: 6px;
+         padding: 1px 6px; font-size: 13px; color: #b9c6ff; }
+
+  /* The banner is the whole point of this page: it is the ONLY thing that changes, it changes
+     colour (so two frames differ in pixels), and it changes LATE (so a capture taken the moment
+     the action returns sees the previous state). */
+  #slow-status {
+    padding: 22px 26px;
+    border-radius: 14px;
+    background: #3a4150;
+    border: 1px solid rgba(255,255,255,.08);
+    font-size: 26px;
+    font-weight: 650;
+    margin-bottom: 28px;
+  }
+  #slow-status[data-state="loaded"] { background: #1f8f4e; }
+  #slow-status[data-state="clicked"] { background: #2563c9; }
+
+  button {
+    font: inherit; font-weight: 600; cursor: pointer;
+    padding: 12px 22px; border-radius: 10px; border: 0;
+    background: #e6e9ef; color: #0f1115;
+  }
+  button:hover { background: #fff; }
+
+  #page-marker { position: fixed; right: 24px; bottom: 20px; color: #4b5567; font-size: 12px; letter-spacing: .08em; }
+</style>
+</head>
+<body>
+
+<h1>CUA 延迟反应测试页</h1>
+<p>
+  这一页<b>故意不立刻反应</b>：文档解析后 <b>900 ms</b> 才渲染出内容，点击 <code>#slow-go</code> 后
+  <b>900 ms</b> 才更新。它证明「动作后的截图」等的是<b>页面的反应</b>，而不是动作返回的那一刻 ——
+  后者拍到的是动作发生<b>之前</b>的状态。
+</p>
+
+<div id="slow-status" data-state="pending">PENDING — 页面尚未反应</div>
+<button id="slow-go" type="button">延迟按钮</button>
+
+<div id="page-marker">SLOW TEST PAGE</div>
+
+<script>
+  // Both reactions are scheduled on a timer, which is the case a grace period exists for: when the
+  // action returns, nothing has changed yet, and "nothing has changed yet" must not read as
+  // "already finished".
+  const status = document.getElementById('slow-status');
+
+  setTimeout(() => {
+    status.dataset.state = 'loaded';
+    status.textContent = 'READY (loaded)';
+  }, 900);
+
+  document.getElementById('slow-go').addEventListener('click', () => {
+    setTimeout(() => {
+      status.dataset.state = 'clicked';
+      status.textContent = 'READY (click handled)';
+    }, 900);
+  });
+</script>
+</body>
+</html>

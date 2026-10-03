@@ -18,8 +18,11 @@ is copied.
 | `browser_snapshot` | no | the current URL, title and visible text |
 | `browser_screenshot` | no | the current screen as an image |
 
-The read-only pair never raises an approval, because neither can change the page. The gated pair asks
-first, in one line of the UI's own language wherever the Host still exposes that preference, and does nothing at all unless the answer is "allow once".
+The read-only pair never raises an approval, because neither can change the page. "After navigation"
+and "after the action" mean after the page has been given a bounded chance to react — see
+[Waiting for the page to react](#waiting-for-the-page-to-react). The gated pair asks
+first, in one line of the UI's own language wherever the Host still exposes that preference, and does
+nothing at all unless the answer is "allow once".
 
 **That line is always English on DSH `0.2.0-rc.2`**, which removed the Host-side locale read a plugin
 could consult; on `0.1.5-rc.2`/`rc.3` it is localised. [docs/design.md](docs/design.md) has the
@@ -69,11 +72,19 @@ tests do:
 | `artifactsDir` | `$DSH_HOME/cua-preview/artifacts` | where screenshot evidence PNGs are written |
 | `headless` | `true` | run Chrome headless |
 | `chromePath` | auto-detected | explicit Chrome/Chromium executable |
+| `settle` | `{graceMs: 250, idleMs: 400, capMs: 3000}` | how long to wait for the page to finish reacting before the post-action screenshot |
 
 Chrome is looked up through `$DSH_CUA_CHROME_PATH` and the usual Linux install paths
 (`/usr/bin/google-chrome-stable`, `/usr/bin/google-chrome`, `/usr/bin/chromium`,
 `/usr/bin/chromium-browser`, `/snap/bin/chromium`), and is launched with the standard
 container-safe flags.
+
+`settle` accepts `false` (no wait at all — the result then reports no `settled` field, because the
+plugin will not claim a property it never verified), a number (the total budget in milliseconds), or
+an object overriding any of `graceMs` (how long before the page is believed to have started
+reacting), `idleMs` (how long each condition must hold) and `capMs` (the total budget). Any other
+value is logged and ignored in favour of the defaults, so a misconfigured timer cannot stop the
+plugin from loading.
 
 ## The browser library choice: Puppeteer
 
@@ -108,6 +119,25 @@ answering as soon as the call settles, because the result then carries the same 
 `before the action`. [docs/design.md](docs/design.md) has both routes, the reason a plugin may not append
 a session event of its own, and why the shipped single-occupancy slot inside the approval card is left
 alone.
+
+## Waiting for the page to react
+
+A frame is only the action's result if the page has finished reacting to it. `page.click()` returns
+the moment the input is dispatched, and `goto` with `domcontentloaded` returns before a JS-rendered
+page has rendered anything, so a capture taken the instant the action returns is the state the action
+*started* from. Measured on a page whose own reaction takes 900 ms, that frame was written 64 ms after
+the action and still read `PENDING` — useless to the person deciding whether it worked.
+
+Every gated action therefore waits before its screenshot: a **grace** period (250 ms) during which the
+page is not believed to have started reacting, then for the **network to go quiet** (400 ms with no
+request still awaiting a response), then for the **DOM to stop changing** (400 ms with an identical
+fingerprint — URL, title, element count and a hash of the body text), all bounded by a **budget**
+(3 s). A page that never goes quiet costs the budget once.
+
+The wait is a heuristic with a budget, so it cannot promise a frame is final. What it can promise is
+that it never *claims* more than it verified: when the budget runs out the result carries
+`settled: false`, `networkBusy` names which condition never held, and the model-facing text says the
+frame may be mid-update.
 
 ## What the model is told when the user says no
 
@@ -170,6 +200,11 @@ and handy for trying the plugin by hand:
 ```sh
 node examples/test-page/serve.mjs --port 3097 --host 127.0.0.1
 ```
+
+[`slow.html`](examples/test-page/slow.html) in the same directory is the fixture behind the settle
+checks: its banner changes colour 900 ms after the document loads and 900 ms after its button is
+clicked, so a frame taken the moment an action returns is visibly the *previous* state. Open it in the
+same server (`http://127.0.0.1:3097/slow.html`) to watch the difference by hand.
 
 ## Documentation
 

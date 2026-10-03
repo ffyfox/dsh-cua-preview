@@ -13,7 +13,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { BrowserController } from './browser.js'
+import { BrowserController, SETTLE_DEFAULTS } from './browser.js'
 import { CuaApprovalBroker } from './approval-broker.js'
 import { registerBrowserTools } from './tools.js'
 import { PendingFrames } from './pending-frames.js'
@@ -37,9 +37,69 @@ export const inject = ['tools', 'approval']
 /** Live plugin instances. See {@link cuaPreviewOf}. */
 const liveInstances = []
 
+/**
+ * Resolve the post-action settle budget from plugin config.
+ *
+ * `settle` accepts, conservatively:
+ *
+ * - **omitted** — {@link SETTLE_DEFAULTS}.
+ * - **`false`** — no wait at all. A map or a link target that reacts instantly needs none, and a
+ *   page that never goes quiet is faster without it. The result then carries no `settled` field:
+ *   the plugin does not claim a property it never verified.
+ * - **a non-negative number** — the total cap in milliseconds; the other two values keep their
+ *   defaults.
+ * - **an object** — any of `graceMs`, `idleMs`, `capMs`, each a non-negative number.
+ *
+ * Anything else (a string, `true`, a negative number, an unknown shape) logs a warning and falls
+ * back to the defaults rather than throwing: a misconfigured timer must not stop the plugin from
+ * loading, and the defaults are the documented behaviour.
+ *
+ * Exported for the acceptance harness and for a host that wants to validate its configuration
+ * before loading the plugin. It is a plain function, not a Cordis service.
+ *
+ * @param {object} [config] - the plugin config.
+ * @param {object} [logger] - optional logger for rejected values.
+ * @returns {{graceMs: number, idleMs: number, capMs: number}|null} the budget, or null to skip the wait.
+ */
+export function settleOptionsOf(config = {}, logger) {
+  const raw = config.settle
+  if (raw === undefined) return { ...SETTLE_DEFAULTS }
+  if (raw === false) return null
+  const reject = (detail) => {
+    logger?.warn?.(`[dsh-cua-preview] ignoring config.settle (${detail}); using the defaults`)
+    return { ...SETTLE_DEFAULTS }
+  }
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw < 0) return reject(`expected a non-negative number, got ${String(raw)}`)
+    return { ...SETTLE_DEFAULTS, capMs: raw }
+  }
+  if (raw !== null && typeof raw === 'object') {
+    const budget = { ...SETTLE_DEFAULTS }
+    for (const key of Object.keys(SETTLE_DEFAULTS)) {
+      if (raw[key] === undefined) continue
+      const value = raw[key]
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        return reject(`${key} must be a non-negative number`)
+      }
+      budget[key] = value
+    }
+    return budget
+  }
+  return reject(`unsupported value ${String(raw)}`)
+}
+
+/** One line describing the budget, for the load log. */
+function describeSettle(settle) {
+  return settle === null
+    ? 'disabled'
+    : `grace ${settle.graceMs}ms / quiet ${settle.idleMs}ms / cap ${settle.capMs}ms`
+}
+
 export function apply(ctx, config = {}) {
   const artifactsDir = config.artifactsDir
     ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'cua-preview', 'artifacts')
+
+  const settle = settleOptionsOf(config, ctx.logger)
 
   const browser = new BrowserController({
     ...(config.chromePath === undefined ? {} : { executablePath: config.chromePath }),
@@ -58,7 +118,7 @@ export function apply(ctx, config = {}) {
     frames,
   })
 
-  registerBrowserTools(ctx, { browser, broker, logger: ctx.logger })
+  registerBrowserTools(ctx, { browser, broker, logger: ctx.logger, settle })
   // Reported, not asserted: a Host without an exact-Fetch registry is a normal state (an in-process
   // tree, a headless profile), and the operator's browser then simply shows no live screen while an
   // approval is open. The object is a live record — `connection` is not a declared dependency, so the
@@ -85,7 +145,10 @@ export function apply(ctx, config = {}) {
     return browser.close()
   }, 'dsh-cua-preview: close browser')
 
-  ctx.logger?.info?.(`[dsh-cua-preview] loaded; screenshot artifacts -> ${artifactsDir}`)
+  ctx.logger?.info?.(
+    `[dsh-cua-preview] loaded; screenshot artifacts -> ${artifactsDir}; ` +
+      `post-action settle: ${describeSettle(settle)}`,
+  )
 }
 
 /**

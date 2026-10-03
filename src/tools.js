@@ -14,6 +14,7 @@
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { SETTLE_DEFAULTS } from './browser.js'
 import { approvalLanguage, describeAction, refusalNotice } from './action-text.js'
 
 /**
@@ -100,6 +101,65 @@ function gatedFrames(value) {
 }
 
 /**
+ * The one line that says a post-action frame may not be the final state.
+ *
+ * The frame is captured after the page was given a bounded chance to react (see
+ * `BrowserController.settle`). When that chance ran out, saying so is the honest thing: the model
+ * is otherwise told the image "shows the action's effect" and can read a half-rendered page as the
+ * result. Silence here would be a claim the plugin did not verify.
+ *
+ * @param {object} value - the canonical execution value.
+ * @returns {string[]} zero or one line.
+ */
+function settleNote(value) {
+  if (value.settled !== false) return []
+  // Which condition was still false when the budget ran out is worth naming: a still-busy network
+  // points at a slow fetch, a still-changing DOM at a page that repaints in a loop.
+  const waited = typeof value.settleMs === 'number' ? ` after ${value.settleMs}ms` : ''
+  const reason = value.networkBusy === true
+    ? `the page was still making network requests${waited}`
+    : `the page's DOM was still changing${waited}`
+  return [`settled: false — ${reason}; this frame may be mid-update`]
+}
+
+/**
+ * Wait for the page to stop changing, and shape the wait into result fields.
+ *
+ * Returns a spreadable object rather than a value so a settle that was skipped (config
+ * `settle: false`) or could not be evaluated reports NOTHING instead of claiming `settled: true`.
+ * The schema declares all three fields optional for exactly that reason.
+ *
+ * A settle failure must never fail the action: the action already ran, and the frame is still worth
+ * taking. A cancellation is the one exception — an aborted call must abort.
+ *
+ * @param {object} browser - the browser control layer.
+ * @param {{graceMs: number, idleMs: number, capMs: number}|null} settle - resolved budget, or null.
+ * @param {AbortSignal} [signal] - the tool execution signal.
+ * @param {object} [logger] - optional logger.
+ * @returns {Promise<object>} the fields to spread into the result value.
+ */
+async function settleAfterAction(browser, settle, signal, logger) {
+  if (settle === null) return {}
+  try {
+    const outcome = await browser.settle({ ...settle, ...(signal === undefined ? {} : { signal }) })
+    return {
+      settled: outcome.settled,
+      settleMs: outcome.ms,
+      // Present only when the wait gave up, where it names the condition that never held.
+      ...(outcome.settled ? {} : { networkBusy: outcome.networkIdle !== true }),
+    }
+  } catch (error) {
+    if (signal?.aborted === true || error?.name === 'AbortError') throw error
+    logger?.warn?.(
+      `[dsh-cua-preview] the post-action settle failed; capturing anyway: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
+    return {}
+  }
+}
+
+/**
  * Project the card facts for one approval-gated action.
  *
  * `output.presentationMeta` is persisted by the core on `tool/result` as `result.meta`, transported
@@ -161,7 +221,7 @@ async function saveApprovalFrame(ctx, outcome, logger) {
  * @param {import('./approval-broker.js').CuaApprovalBroker} deps.broker - approval broker.
  * @param {object} [deps.logger] - logger.
  */
-export function registerBrowserTools(ctx, { browser, broker, logger }) {
+export function registerBrowserTools(ctx, { browser, broker, logger, settle = SETTLE_DEFAULTS }) {
   // ---- Read-only tools: no approval ------------------------------------------------------
 
   ctx.tools.register(defineTool({
@@ -172,7 +232,10 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
       'If the result says the user rejected (or cancelled) the request, the navigation did not ' +
       'happen: that is a decision by the user, not a failure — do not retry the same navigation, ' +
       'stop and ask the user what to change or what to do next. ' +
-      'The returned screenshot shows the page AFTER navigation, so it is the result. ' +
+      'The returned screenshot shows the page AFTER navigation, so it is the result: the plugin ' +
+      'waits for the page to stop changing — its network quiet, its DOM stable — before capturing, ' +
+      'bounded by the configured settle budget (3 s by default). If the result reports ' +
+      '`settled: false`, that budget ran out first and the frame may still be mid-update. ' +
       'A granted navigation returns two images in order: first the screen the user was shown when ' +
       'they approved it (the card captions that one "before the action"), then the frame after ' +
       'navigation. A first navigation from a blank tab has no approval-time screen and returns one ' +
@@ -193,6 +256,11 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
           approvalScreenshotPath: { type: 'string' },
           image: IMAGE_VALUE_SCHEMA,
           approvalImage: IMAGE_VALUE_SCHEMA,
+          // Deliberately not `required`: a refusal runs no settle, and a disabled one reports
+          // nothing, so absence is a real state rather than a bug.
+          settled: { type: 'boolean' },
+          settleMs: { type: 'integer' },
+          networkBusy: { type: 'boolean' },
         },
       },
       render: (_args, value) => imageContent(
@@ -206,6 +274,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
                 ? []
                 : [`screenshot (state at approval time): ${value.approvalScreenshotPath}`]),
               ...(value.screenshotPath === '' ? [] : [`screenshot (after navigation): ${value.screenshotPath}`]),
+              ...settleNote(value),
             ].join('\n')
           : [
               // The notice leads, so the first thing the model reads is that a human said no.
@@ -245,6 +314,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
       try {
         if (!outcome.granted) return refusedNavigate(ctx, browser, outcome, logger)
         const result = await browser.navigate(args.url, exec.signal)
+        const settleFields = await settleAfterAction(browser, settle, exec.signal, logger)
         const after = await captureResult(ctx, browser, broker, logger, 'navigate')
         const before = await saveApprovalFrame(ctx, outcome, logger)
         return {
@@ -253,6 +323,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
           granted: true,
           decision: outcome.decision,
           screenshotPath: after.path,
+          ...settleFields,
           ...(outcome.screenshot?.path === undefined ? {} : { approvalScreenshotPath: outcome.screenshot.path }),
           ...(after.attachment === null ? {} : { image: after.attachment }),
           ...(before === null ? {} : { approvalImage: before }),
@@ -344,8 +415,11 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
       'This result carries up to two images, in this order: the screen the user was shown when ' +
       'they approved the action (the card captions that one "before the action" — it is the frame ' +
       'they reviewed, and it is NOT the action\'s effect), then the screen AFTER the action ran. ' +
-      'That second frame is normally the action\'s effect, so no follow-up screenshot is needed to ' +
-      'confirm it. A refusal returns the approval-time frame alone. Each frame\'s file ' +
+      'The plugin waits for the page to stop changing — its network quiet, its DOM stable — before ' +
+      'capturing the second frame, bounded by the configured settle budget (3 s by default). That ' +
+      'second frame is normally the action\'s effect, so no follow-up screenshot is needed to ' +
+      'confirm it; if the result reports `settled: false`, the budget ran out first and the frame ' +
+      'may still be mid-update. A refusal returns the approval-time frame alone. Each frame\'s file ' +
       'path is reported in the result text for audit.',
     parameters: {
       action: {
@@ -378,6 +452,11 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
           approvalScreenshotPath: { type: 'string' },
           image: IMAGE_VALUE_SCHEMA,
           approvalImage: IMAGE_VALUE_SCHEMA,
+          // Deliberately not `required`: a refusal runs no settle, and a disabled one reports
+          // nothing, so absence is a real state rather than a bug.
+          settled: { type: 'boolean' },
+          settleMs: { type: 'integer' },
+          networkBusy: { type: 'boolean' },
         },
       },
       render: (_args, value) => imageContent(
@@ -391,6 +470,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
                 ? []
                 : [`screenshot (state at approval time): ${value.approvalScreenshotPath}`]),
               ...(value.screenshotPath === '' ? [] : [`screenshot (state AFTER the action): ${value.screenshotPath}`]),
+              ...settleNote(value),
             ].join('\n')
           : [
               // The notice leads, so the first thing the model reads is that a human said no.
@@ -463,6 +543,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
         else if (args.action === 'fill') await browser.fill(args.selector, args.value, exec.signal)
         else await browser.submit(args.selector, exec.signal)
 
+        const settleFields = await settleAfterAction(browser, settle, exec.signal, logger)
         const state = await browser.snapshot()
         const after = await captureResult(ctx, browser, broker, logger, args.action)
         const before = await saveApprovalFrame(ctx, outcome, logger)
@@ -473,6 +554,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
           decision: outcome.decision,
           url: state.url,
           screenshotPath: after.path,
+          ...settleFields,
           ...(outcome.screenshot?.path === undefined ? {} : { approvalScreenshotPath: outcome.screenshot.path }),
           ...(after.attachment === null ? {} : { image: after.attachment }),
           ...(before === null ? {} : { approvalImage: before }),
@@ -492,6 +574,13 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
  * model reading that as "the click failed" and re-verifying with an extra screenshot. The approval
  * frame is still taken (by the broker) and still written to disk for audit; it is simply not what
  * the tool returns as `image`.
+ *
+ * Being *after* the action is not enough on its own. `page.click()` returns the moment the input is
+ * dispatched, so this used to capture the state the action started FROM: measured against a page
+ * whose own reaction takes 900 ms, the frame was taken 64 ms in and still read `PENDING`, which is
+ * useless to the person deciding whether the click worked. The wait in `BrowserController.settle`,
+ * which runs before this capture, is what makes the frame the action's result rather than its
+ * precondition.
  *
  * A capture failure is non-fatal: the action already happened, so the tool reports it without an
  * image rather than turning a successful action into an error.
