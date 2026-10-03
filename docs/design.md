@@ -134,6 +134,18 @@ the approval-time state and is captioned `at approval time (no action ran)`. Rol
 `presentationMeta.frames`, never from an image's position and never from `granted` alone — so a grant
 whose post-action capture failed keeps `before the action` on its one frame.
 
+**Every frame is painted into a box reserved from its own reference.** `ImageAttachmentRef` carries
+`width` and `height` as required fields, filled by the attachment service's measurement of the bytes it
+stored, so a frame's size is known before its bytes are; the loading paint is the same element with the
+same geometry as the loaded one. The reason is the conversation's own scroll behaviour, not tidiness: a
+row that grows again after the fact makes the shipped follow-the-tail controller drop the tail. Its growth
+observer starts one smooth scroll on the first growth, the next growth arrives while that scroll is
+outstanding and is skipped (`ScrollFollow.toBottom` returns while `this.target !== null`), and the landing
+is then short of the taller floor — which `settle` reads as the reader having moved, releasing follow
+intent for good. One growth leaves the app's own logic to land on the true bottom, which is what keeps the
+`after the action` frame fully visible after an approval. A reference without usable dimensions reserves
+nothing and keeps the plain-text placeholder rather than claiming a size it does not know.
+
 What the live frame costs, stated rather than hidden:
 
 - **It is a live read, not a record.** The route answers `404` the moment the call settles, because the

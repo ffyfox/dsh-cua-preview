@@ -111,6 +111,16 @@ ran, so the one image returned *is* the approval-time frame, captioned `at appro
 A screen that is genuinely blank (an unloaded, empty tab) emits no frame at all rather than a useless
 white rectangle.
 
+**A frame's box is reserved before its bytes arrive.** Each image is painted at the `aspect-ratio` its own
+durable reference records (`ImageAttachmentRef.width`/`height` are required fields), and the loading paint
+is the same element with the same geometry as the loaded one. That is not cosmetic. A row that grows again
+after the fact makes the conversation's own follow-the-tail logic lose the tail: its growth observer starts
+one smooth scroll, the next growth lands while that scroll is still outstanding and is skipped, and the
+landing is then short of the taller floor — which the shipped controller reads as the reader having moved,
+so it stops following (`dsh-client-ui-chat`, `ScrollFollow`). Two frames that each grew twice would leave
+the second one below the fold after an approval; reserving the box leaves exactly one growth to follow, so
+the app's own logic lands on the true bottom and the `after the action` frame is fully visible.
+
 **While you are deciding, the screen is already on screen.** The call's row paints the current screen from
 the moment the approval appears, and it is a *live* read: at that point nothing has been logged, so the
 frame comes from the Host's own copy of it — the bytes captured an instant before the question was asked,

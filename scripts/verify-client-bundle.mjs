@@ -545,14 +545,61 @@ const coldLoader = Object.assign(async () => 'blob:cold', { peek: () => undefine
     collect(tree, 'span').some((s) => s.props?.children === 'browser_act') &&
       collect(tree, 'span').some((s) => s.props?.children === 'click #go'),
   )
+  check(
+    'the loaded image still declares the reference\'s own pixel dimensions',
+    images[0]?.props?.style?.aspectRatio === '640 / 480',
+    String(images[0]?.props?.style?.aspectRatio),
+  )
 }
 
-// --- cold cache: a loading placeholder instead of a broken image ----------------------------
+// --- cold cache: the box is reserved, so the row cannot grow when the bytes arrive -----------
+//
+// This is the whole point of the reservation. A row that grows after the fact makes the
+// conversation's own follow-the-tail logic lose the tail: it starts one smooth scroll, skips the
+// next growth while that scroll is outstanding, and then reads the short landing as "the reader
+// moved" and stops following (`dsh-client-ui-chat`, `ScrollFollow`). Two frames that each grow the
+// row twice — placeholder, then decoded image — are enough to strand the second frame below the
+// fold. So the loading paint and the loaded paint must be the same box.
+
+/** The geometry both frame states must share; the fill is deliberately excluded. */
+const boxOf = (style) => JSON.stringify({
+  display: style?.display,
+  width: style?.width,
+  maxWidth: style?.maxWidth,
+  height: style?.height,
+  aspectRatio: style?.aspectRatio,
+  border: style?.border,
+})
 
 {
-  const tree = render(settledBlock, coldLoader)
-  check('a cold cache renders a loading placeholder, not a broken image',
-    collect(tree, 'img').length === 0 && collect(tree, 'div').length > 0)
+  const warm = collect(render(settledBlock, cachedLoader), 'img')
+  const cold = collect(render(settledBlock, coldLoader), 'img')
+  check('a cold cache paints the frame element itself', cold.length === 1, `img nodes=${cold.length}`)
+  check('  ↳ it carries no src: nothing claims bytes that have not arrived',
+    cold[0]?.props?.src === undefined, `src=${String(cold[0]?.props?.src)}`)
+  check('  ↳ it reserves the box from the reference\'s own pixel dimensions',
+    cold[0]?.props?.style?.aspectRatio === '640 / 480', String(cold[0]?.props?.style?.aspectRatio))
+  check('  ↳ loading and loaded are the same box, so neither paint can move the row',
+    boxOf(cold[0]?.props?.style) === boxOf(warm[0]?.props?.style),
+    `cold=${boxOf(cold[0]?.props?.style)} warm=${boxOf(warm[0]?.props?.style)}`)
+}
+
+{
+  // A reference with no usable size cannot reserve anything, so it must not paint a box that
+  // implies a size it does not know; it keeps the old wording instead.
+  const bare = { attachmentId: 'sha256:bare', mediaType: 'image/png', bytes: 12 }
+  const content = [{ type: 'image', attachment: bare }]
+  const cold = render({ ...settledBlock, content }, coldLoader)
+  const warm = render({ ...settledBlock, content }, cachedLoader)
+  check('a reference with no usable dimensions reserves nothing and says so',
+    collect(cold, 'img').length === 0 &&
+      collect(cold, 'div').some((d) => typeof d.props?.children === 'string' &&
+        d.props.children.includes('loading screenshot')),
+    `img nodes=${collect(cold, 'img').length}`)
+  check('  ↳ it also tolerates a zero-sized reference, and still renders once loaded',
+    collect(render({ ...settledBlock, content: [{ type: 'image', attachment: { ...bare, width: 0, height: 0 } }] }, coldLoader), 'img').length === 0 &&
+      collect(warm, 'img').length === 1,
+    `zero=${collect(render({ ...settledBlock, content: [{ type: 'image', attachment: { ...bare, width: 0, height: 0 } }] }, coldLoader), 'img').length} warm=${collect(warm, 'img').length}`)
 }
 
 // --- malformed and foreign data must degrade, never throw -----------------------------------

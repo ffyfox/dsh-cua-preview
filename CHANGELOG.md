@@ -7,6 +7,20 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The `after the action` frame stayed below the fold after an approval.** Each frame's box is now
+  reserved from its own durable reference — `ImageAttachmentRef.width`/`height` are required fields, so
+  the size is known before the bytes are — and the loading paint is the same element with the same
+  geometry as the loaded one. Previously each frame painted a short text placeholder and then an unsized
+  `<img>`, so a two-frame result grew the row up to four times in a row. The conversation's shipped
+  follow-the-tail controller starts one smooth scroll on the first growth, skips the next growth while
+  that scroll is outstanding (`ScrollFollow.toBottom` returns while `this.target !== null`), and then
+  reads the short landing as the reader having moved, releasing follow intent for good. Reserving the box
+  leaves exactly one growth to follow, so the app's own logic lands on the true bottom. The loading
+  wording is now a skeleton-filled box of the final size; a reference with no usable dimensions keeps the
+  text placeholder instead of claiming a size it does not know. The reservation is pinned twice: the
+  Client verifier asserts that the loading paint and the loaded paint are the same box, and the acceptance
+  harness measures it in a real browser — a reserved box is 402 px tall and decoding the bytes leaves it
+  at 402 px, while the old two-step paint moves the row from 42 px to 402 px.
 - **A gated action made its own session unopenable, and the plugin no longer writes to the Session log at
   all.** The approval-time frame used to be referenced from a plugin-owned `cua/preview` session event.
   That type is outside the harness's `KNOWN_SESSION_EVENT_TYPES`, and the envelope's `ignorable: true`

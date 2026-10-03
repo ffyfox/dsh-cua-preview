@@ -1184,6 +1184,70 @@ console.log('\n--- approval sentence: wording and language ---\n')
   disposeSettings()
 }
 
+// ---- The frame box is reserved: measured in the real engine ----------------------------------
+//
+// The fix for "the `after the action` frame stayed below the fold after an approval" rests on one
+// browser fact: an `<img>` with no source yet, carrying the reference's own aspect ratio, already
+// occupies exactly the box the loaded image will occupy. That leaves the row ONE growth for the
+// conversation's follow-the-tail logic to follow, instead of one per frame per load — and a row
+// that grows twice is what made the shipped controller skip the second growth and then read the
+// short landing as the reader having moved. Node cannot answer this question (the Client verifier
+// has no layout); this browser can. The control below keeps the check from being vacuous: the OLD
+// two-step paint really does move the row.
+
+await page.setContent('<!doctype html><html><body style="margin:0;background:#123f8b">'
+  + '<div id="host" style="width:1280px"></div></body></html>')
+const framePng = await page.screenshot({ type: 'png' })
+// `screenshot()` hands back a Uint8Array, not a Buffer: base64 has to go through Buffer explicitly.
+const frameDataUrl = `data:image/png;base64,${Buffer.from(framePng).toString('base64')}`
+
+// The frame's own paint, exactly as the Client declares it (width, cap, border, auto height).
+const frameBoxCss = 'display:block;width:100%;max-width:640px;height:auto;border-radius:12px;'
+  + 'border:0.5px solid rgba(0,0,0,.2)'
+
+const frameLayout = await page.evaluate(async ({ dataUrl, box }) => {
+  const host = document.getElementById('host')
+  const height = () => host.firstElementChild.getBoundingClientRect().height
+  // Learn the real pixel size first: this is what the Host measures and writes into the reference.
+  host.innerHTML = `<img style="${box}">`
+  const probe = host.firstElementChild
+  probe.src = dataUrl
+  await probe.decode()
+  const natural = { width: probe.naturalWidth, height: probe.naturalHeight }
+  // Reserved: the reference's dimensions are known, the bytes are not.
+  host.innerHTML = `<img style="${box};aspect-ratio:${natural.width} / ${natural.height}">`
+  const reserved = height()
+  const image = host.firstElementChild
+  image.src = dataUrl
+  await image.decode()
+  const loaded = height()
+  // Control: the old paint — a short text placeholder, then an image with no reserved box.
+  host.innerHTML = '<div style="font-size:13px;line-height:20px;border:0.5px dashed rgba(0,0,0,.3);'
+    + 'border-radius:12px;padding:10px 12px">loading screenshot…</div>'
+  const placeholder = height()
+  host.innerHTML = `<img style="${box}">`
+  const unsized = host.firstElementChild
+  unsized.src = dataUrl
+  await unsized.decode()
+  const unsizedLoaded = height()
+  // The box is capped at 640px wide, so the height its dimensions imply is 640 / (w/h).
+  const implied = 640 * natural.height / natural.width
+  return { natural, implied, reserved, loaded, placeholder, unsizedLoaded }
+}, { dataUrl: frameDataUrl, box: frameBoxCss })
+
+check('the reserved box is a real box before any bytes exist',
+  frameLayout.reserved > 100, `reserved=${frameLayout.reserved}px`)
+check('  ↳ it is the height the reference\'s own pixel dimensions imply',
+  frameLayout.reserved >= frameLayout.implied && frameLayout.reserved - frameLayout.implied <= 2,
+  `reserved=${frameLayout.reserved}px implied=${frameLayout.implied}px `
+    + '(the difference is the box\'s own two 0.5px borders, which the rect includes)')
+check('  ↳ decoding the bytes does not move it: one growth for the row, not two',
+  frameLayout.loaded === frameLayout.reserved,
+  `reserved=${frameLayout.reserved}px loaded=${frameLayout.loaded}px`)
+check('  ↳ control: the old two-step paint DOES move the row, so the check above is not vacuous',
+  frameLayout.unsizedLoaded !== frameLayout.placeholder,
+  `placeholder=${frameLayout.placeholder}px image=${frameLayout.unsizedLoaded}px`)
+
 // Teardown runs here, not before the section above: the sentence is produced by the real tool
 // driving the real browser, so both have to still be alive while it is checked.
 await ctx.loader.stop?.()

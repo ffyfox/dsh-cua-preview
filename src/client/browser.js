@@ -186,6 +186,21 @@ window.__ModuleLoader__.load({
 				borderRadius: "12px",
 				border: "0.5px solid var(--dsw-alias-border-l2)"
 			},
+			/**
+			 * The frame's box while its bytes are still on the way.
+			 *
+			 * Same element, same geometry as {@link S.image} — only the fill differs — because the row
+			 * must reach its final height on its first paint. See {@link frameBox}.
+			 */
+			imagePending: {
+				display: "block",
+				width: "100%",
+				maxWidth: "640px",
+				height: "auto",
+				borderRadius: "12px",
+				border: "0.5px solid var(--dsw-alias-border-l2)",
+				background: "var(--dsw-alias-bg-skeleton)"
+			},
 			caption: {
 				fontSize: "12px",
 				lineHeight: "18px",
@@ -291,6 +306,48 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * The box one frame occupies, from the reference's own verified pixel dimensions.
+		 *
+		 * Every `ImageAttachmentRef` carries `width` and `height` as required fields
+		 * (`docs/persistence-catalog.md`: `packages/attachment/attachment/src/types.ts#ImageAttachmentRef`),
+		 * and the Host writes them from the attachment service's own measurement of the bytes it stored.
+		 * So the size is known before the bytes are — which is the point here.
+		 *
+		 * **Why the row has to reach its final height on its first paint.** A row that grows again
+		 * after the fact makes the conversation's follow-the-tail logic lose the tail: its growth
+		 * observer starts one smooth scroll, the next growth arrives while that scroll is still
+		 * outstanding and is skipped, and the landing is then short of the (now taller) floor — which
+		 * the shipped controller reads as the reader having moved, so it releases follow intent for
+		 * good (`dsh-client-ui-chat`: `ScrollFollow.toBottom` bails while `this.target !== null`, and
+		 * `settle` then computes `following = nearBottom(...)`). Reserving the box leaves exactly one
+		 * growth to follow, so the app's own logic lands on the true bottom.
+		 *
+		 * @param image - a validated `ImageAttachmentRef`.
+		 * @returns the CSS `aspect-ratio` value, or null when the size is unusable.
+		 */
+		function frameBox(image) {
+			const width = image?.width;
+			const height = image?.height;
+			if (typeof width !== "number" || typeof height !== "number") return null;
+			if (Number.isFinite(width) !== true || Number.isFinite(height) !== true) return null;
+			if (width <= 0 || height <= 0) return null;
+			return `${width} / ${height}`;
+		}
+
+		/**
+		 * The geometry of a frame, whether or not its bytes have arrived.
+		 *
+		 * @param image - a validated `ImageAttachmentRef`.
+		 * @param pending - whether the bytes are still on the way.
+		 * @returns the style for the frame element.
+		 */
+		function frameStyle(image, pending) {
+			const ratio = frameBox(image);
+			const base = pending === true ? S.imagePending : S.image;
+			return ratio === null ? base : { ...base, aspectRatio: ratio };
+		}
+
+		/**
 		 * One durable screenshot, resolved to a session-authorized URL.
 		 *
 		 * @param props.image - the `ImageAttachmentRef` to display.
@@ -321,8 +378,18 @@ window.__ModuleLoader__.load({
 			}, [image, loadImage, url, failed]);
 
 			if (failed) return jsx("div", { style: S.imageFallback, children: "screenshot could not be loaded" });
-			if (url === null) return jsx("div", { style: S.imageFallback, children: "loading screenshot…" });
-			return jsx("img", { src: url, alt: "Browser screenshot", style: S.image });
+			// A reference without usable dimensions cannot reserve anything, so it keeps the old
+			// wording rather than painting an empty box that claims a size it does not know.
+			if (url === null && frameBox(image) === null) {
+				return jsx("div", { style: S.imageFallback, children: "loading screenshot…" });
+			}
+			// Reserving and loading paint the same element with the same geometry, so the box cannot
+			// drift between the two states: only the fill and the presence of a source differ.
+			return jsx("img", {
+				...(url === null ? {} : { src: url }),
+				alt: "Browser screenshot",
+				style: frameStyle(image, url === null)
+			});
 		}
 
 		/**
