@@ -44,6 +44,20 @@ const EXPECTED = ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 
 const UNREFERENCED = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 
 /**
+ * The exact sentence the click's approval prompt can carry, one per shipped browser locale.
+ *
+ * Both are spelled out rather than derived from one another so the harness can assert what the plugin
+ * produced against an expectation the plugin's own locale read cannot influence. `config.declaredLocale`
+ * is what the harness parsed out of the profile's `cordis.patch.yml`; the live read is reported
+ * separately. That separation is the fix for the blind spot this probe used to have: on DSH
+ * 0.2.0-rc.2 the Host-side channel was removed, both the plugin and the probe fell back to English
+ * together, and the derived comparison stayed green while the Chinese sentence had silently stopped
+ * appearing.
+ */
+const ENGLISH_REASON = 'Click the button "Go" (#go)'
+const CHINESE_REASON = '点击按钮「Go」（#go）'
+
+/**
  * Summarize a thrown remote failure without depending on its exact class.
  *
  * @param error - whatever the call threw.
@@ -92,7 +106,8 @@ async function run(ctx, config, listed, resultPath) {
   }
 
   try {
-    Object.assign(verdict, await authorizeFrames(ctx))
+    const declaredLocale = typeof config.declaredLocale === 'string' ? config.declaredLocale : null
+    Object.assign(verdict, await authorizeFrames(ctx, declaredLocale))
   } catch (error) {
     verdict.actionError = errorSummary(error)
   }
@@ -112,9 +127,14 @@ async function run(ctx, config, listed, resultPath) {
     verdict.blankNavigationOmittedFrame === true &&
     verdict.credentialReferenced === true &&
     verdict.unreferencedRefused === true &&
-    // The approval sentence is the card's whole consent text, so its language and wording are
-    // checked against the locale this same Host read, not merely recorded.
-    verdict.approvalReasonMatchesExpectedWording === true &&
+    // The approval sentence is the card's whole consent text, so its wording and its language are
+    // checked — but against the language the Host actually exposes, never against a value the plugin
+    // itself produced. (`approvalReasonMatchesExpectedWording` is a derived echo of the same read and
+    // is therefore deliberately NOT part of this gate: it stayed true through the 0.2.0-rc.2
+    // regression, when the Host channel disappeared and took both sides down to English together.
+    // The non-circular comparison lives in the harness, against the profile's declared locale.)
+    verdict.approvalReasonWordingIsExact === true &&
+    verdict.approvalReasonLanguageMatchesTheHostChannel === true &&
     // The reported failure mode: a refusal that never reached the model. It is checked in the real
     // product, through the real pipeline, because a direct `execute()` call skips the
     // output-schema validation the refusal used to die in.
@@ -206,9 +226,12 @@ async function refuseThroughThePipeline(ctx) {
  * NO credential frame for it. Every check below therefore applies to the click.
  *
  * @param ctx - the real Host context.
+ * @param declaredLocale - the locale the profile's own `cordis.patch.yml` declares, or null when the
+ *   harness could not read one (a fresh CI profile has no patch file). Passed IN on purpose: it is
+ *   the only locale fact here that the plugin's live read cannot move.
  * @returns the authorization evidence.
  */
-async function authorizeFrames(ctx) {
+async function authorizeFrames(ctx, declaredLocale) {
   const { SessionId } = await import('@deepseek-ai/dsh-session')
 
   // Answer our own approval. Without a human answerer attached to this temporary profile the seam
@@ -283,17 +306,27 @@ async function authorizeFrames(ctx) {
   const previewEvent = previewEvents[0]
   const previewContent = previewEvent?.data?.content
 
-  // The approval sentence in the REAL product, against the locale this Host actually resolves.
+  // The approval sentence in the REAL product: what language the Host exposes, what language the
+  // sentence actually came out in, and what the profile declared independently of both.
   //
-  // The plugin builds the sentence from `ctx.get('settings').get('locale').preference`
-  // (`@deepseek-ai/dsh-client-locale`'s Host half registers that namespace; `dsh-settings-file` is
-  // the provider). This probe reads the same documented service the same way, so the expectation is
-  // derived from whatever this deployment really resolves rather than hard-coded — including the
-  // case where no provider is mounted, where both sides must land on English.
+  // The plugin builds the sentence from `ctx.get('settings').get('locale').preference`.
+  // `@deepseek-ai/dsh-client-locale`'s Host half used to register that namespace and
+  // `dsh-settings-file` used to be the provider; DSH 0.2.0-rc.2 replaced `dsh-settings` with a form
+  // projection that has no value-read API at all, so this read now yields nothing and the plugin
+  // honestly falls back to English. This probe therefore reports the channel's state and the
+  // sentence's actual language, and derives its own expectation from the channel — while the harness
+  // compares the result against `declaredLocale`, the locale the profile declares, which is a fact
+  // neither this probe nor the plugin can move.
   const localePreference = ctx.get('settings')?.get?.('locale')?.preference
-  const expectedReason = typeof localePreference === 'string' && localePreference.toLowerCase().startsWith('zh')
-    ? '点击按钮「Go」（#go）'
-    : 'Click the button "Go" (#go)'
+  const localeChannelReadable = typeof localePreference === 'string' && localePreference !== ''
+  const hostLanguage = localeChannelReadable && localePreference.toLowerCase().startsWith('zh') ? 'zh' : 'en'
+  const expectedReason = hostLanguage === 'zh' ? CHINESE_REASON : ENGLISH_REASON
+  const approvalReason = granted.at(-1)
+  const approvalReasonIsChinese = typeof approvalReason === 'string' && /[\u4e00-\u9fff]/u.test(approvalReason)
+  const approvalReasonLanguage = approvalReasonIsChinese ? 'zh' : 'en'
+  const declaredLanguage = typeof declaredLocale !== 'string'
+    ? null
+    : declaredLocale.toLowerCase().startsWith('zh') ? 'zh' : 'en'
 
   return {
     sessionId: String(sessionId),
@@ -301,11 +334,35 @@ async function authorizeFrames(ctx) {
     approvalDecision: result?.decision,
     // Two approvals were answered: the navigation, then the click. The click's sentence is the last.
     navigationReason: granted[0],
-    approvalReason: granted.at(-1),
+    approvalReason,
     settingsServicePresent: ctx.get('settings') !== undefined,
-    localePreference: localePreference ?? null,
+    // --- the locale evidence, in the three forms the harness needs -----------------------------
+    // (1) the raw live read, null when the Host no longer exposes one;
+    localePreference: localeChannelReadable ? localePreference : null,
+    // (2) the channel's state, so a green run cannot hide a channel that went missing;
+    localeChannelReadable,
+    // (3) the profile's own declaration, passed in by the harness;
+    declaredLocale: typeof declaredLocale === 'string' ? declaredLocale : null,
+    declaredLocaleLanguage: declaredLanguage,
+    // and both candidate sentences verbatim, so the harness can assert the exact wording without
+    // recomputing one from the other.
+    englishReason: ENGLISH_REASON,
+    chineseReason: CHINESE_REASON,
+    approvalReasonIsChinese,
+    approvalReasonLanguage,
     expectedApprovalReason: expectedReason,
-    approvalReasonMatchesExpectedWording: granted.at(-1) === expectedReason,
+    // Derived from the channel the plugin itself reads. Kept for continuity, but it CANNOT detect a
+    // channel that went missing, because both sides lose it together — that is the blind spot the
+    // `declaredLocale` fields above exist to close.
+    approvalReasonMatchesExpectedWording: approvalReason === expectedReason,
+    // The two invariants that are not circular: the sentence is one of the two known wordings, and
+    // its language is the language the Host actually exposes.
+    approvalReasonWordingIsExact: approvalReason === ENGLISH_REASON || approvalReason === CHINESE_REASON,
+    approvalReasonLanguageMatchesTheHostChannel: approvalReasonLanguage === hostLanguage,
+    // The independent one: null when the harness had no profile to read.
+    approvalReasonLanguageMatchesDeclaredLocale: declaredLanguage === null
+      ? null
+      : approvalReasonLanguage === declaredLanguage,
     credentialAttachmentId: credential,
     modelFrameAttachmentId: modelFrame,
     previewEventsInSessionLog: previewEvents.length,

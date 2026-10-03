@@ -664,6 +664,108 @@ for (const [label, block] of metaCases) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The explicit stage contract (DSH >= 0.2.0-rc.2).
+// ---------------------------------------------------------------------------------------------
+//
+// From 0.2.0-rc.2 a view no longer receives one frozen block plus the obligation to guess the stage:
+// the owner passes `phase` beside a stage-specific block — `{phase:'preparing', block:
+// PreparingToolCall}` (identity only, NO arguments), `{phase:'start', block: StartedToolCall}`
+// (complete arguments, no result yet), `{phase:'result', block: ToolResultNode}`. Every check above
+// feeds the older spelling and must keep passing, because the package still declares support back to
+// 0.1.5-rc.2, where `kind` was the only stage signal. These pin the newer one.
+
+/** Render one stage exactly as 0.2.0-rc.2 hands it over: `phase` beside a stage-specific block. */
+function renderPhase(phase, block, loadImage, options = {}) {
+  const { callId = 'call-1', useChat = emptyChat } = options
+  return expand(Row({ phase, block, callId, loadImage, useChat }))
+}
+
+/** `PreparingToolCall`: identity and placement only — the arguments are not dispatched yet. */
+const preparingBlock = {
+  callId: 'call-1',
+  name: 'browser_act',
+  turn: 1,
+  step: 1,
+  time: 0,
+  subCalls: [],
+  phase: 'preparing',
+}
+
+/** `StartedToolCall`: complete arguments, no result yet. */
+const startedBlock = {
+  ...preparingBlock,
+  phase: 'start',
+  argsRaw: JSON.stringify({ action: 'click', selector: '#go' }),
+}
+
+/** `ToolResultNode` as 0.2.0-rc.2 passes it at the result stage (`kind` is still the node tag). */
+const resultBlock = { ...settledBlock, kind: 'tool-result', phase: 'result' }
+
+/** The text of every `span` in a rendered tree. */
+const spanTexts = (tree) => collect(tree, 'span').map((span) => span.props?.children)
+
+{
+  let threw = null
+  let tree = null
+  try {
+    tree = renderPhase('preparing', preparingBlock, cachedLoader)
+  } catch (error) {
+    threw = error
+  }
+  check('a preparing call renders without throwing',
+    threw === null, threw === null ? undefined : String(threw))
+  if (threw === null) {
+    const spans = spanTexts(tree)
+    check('  ↳ a preparing call still names the tool',
+      spans.includes('browser_act'), JSON.stringify(spans))
+    check('  ↳ a preparing call paints no argument summary, because it has no arguments yet',
+      !spans.some((text) => typeof text === 'string' && text !== 'browser_act'),
+      JSON.stringify(spans))
+    check('  ↳ a preparing call paints no frame, and could not have one yet',
+      collect(tree, 'img').length === 0, `img nodes=${collect(tree, 'img').length}`)
+  }
+}
+
+{
+  const tree = renderPhase('start', startedBlock, cachedLoader)
+  const spans = spanTexts(tree)
+  check('a started call names the tool and the action it is about to take',
+    spans.includes('browser_act') && spans.includes('click #go'), JSON.stringify(spans))
+  check('  ↳ a started call paints no result frame yet, because no result exists',
+    collect(tree, 'img').length === 0, `img nodes=${collect(tree, 'img').length}`)
+}
+
+{
+  const tree = renderPhase('result', resultBlock, cachedLoader)
+  check('a result stage paints the screenshot',
+    collect(tree, 'img').length === 1, `img nodes=${collect(tree, 'img').length}`)
+}
+
+{
+  // A call that has not produced a result paints no result frame, in either spelling.
+  const tree = renderPhase('start', startedBlock, cachedLoader)
+  check('a started call paints no result frame before its result, in the old spelling too',
+    collect(tree, 'img').length === 0, `img nodes=${collect(tree, 'img').length}`)
+}
+
+{
+  // The stage is also on the block itself (`PreparingToolCall.phase` / `StartedToolCall.phase`), so a
+  // host that passes the block without the sibling prop still lands on the right stage.
+  const tree = renderPhase(undefined, resultBlock, cachedLoader)
+  check('the stage is also read off the block when the owner omits its prop',
+    collect(tree, 'img').length === 1, `img nodes=${collect(tree, 'img').length}`)
+}
+
+{
+  // A stage from a future DSH must degrade to "still running" — never to a result, which would claim
+  // an outcome that has not happened.
+  const tree = renderPhase('aborted', startedBlock, cachedLoader)
+  check('an unknown future stage degrades to running rather than to a result',
+    collect(tree, 'img').length === 0 && spanTexts(tree).includes('click #go'),
+    JSON.stringify(spanTexts(tree)))
+}
+
+// ---------------------------------------------------------------------------------------------
 // The Conversation Definition: the approval-time frame becomes a live, HIDDEN carrier node.
 // ---------------------------------------------------------------------------------------------
 

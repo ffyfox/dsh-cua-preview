@@ -23,6 +23,14 @@
  *    the larger seq. The result was the frame the user was meant to review sitting under the frame
  *    that only exists after they reviewed it.
  *
+ *    **The stage a call is in arrives as an explicit prop from DSH 0.2.0-rc.2 on.** That release
+ *    replaced the single frozen `block` with a `phase` discriminant (`'preparing' | 'start' |
+ *    'result'`) beside a stage-specific block (`PreparingToolCall` / `StartedToolCall` /
+ *    `ToolResultNode`), and a `preparing` block carries no `argsRaw` at all. This view accepts both
+ *    spellings — the package still declares support back to `0.1.5-rc.2`, where the stage had to be
+ *    inferred from the result node's `kind` — preferring `phase` whenever the host supplies it, so
+ *    a stage this build has never heard of degrades to "still running" instead of throwing.
+ *
  * 2. **A hidden data node carrying the approval-time frame** (`ConversationNodeDefinition` over the
  *    plugin-owned `cua/preview` event, kind `cua-preview`, `visibility: 'hidden'`). A tool row
  *    cannot show anything while its call is still running — its content and metadata arrive with
@@ -325,6 +333,32 @@ window.__ModuleLoader__.load({
 			return null;
 		}
 
+		/**
+		 * The lifecycle stage a Tool view is being rendered for.
+		 *
+		 * DSH 0.2.0-rc.2 hands the view an explicit `phase` beside a stage-specific `block`
+		 * (`{phase: 'preparing', block: PreparingToolCall}` / `{phase: 'start', block: StartedToolCall}`
+		 * / `{phase: 'result', block: ToolResultNode}`). Up to 0.1.5-rc.3 there was no `phase`: one
+		 * frozen block arrived and the stage had to be inferred from `kind`, which only the result
+		 * node carries. Both spellings are accepted, with the declared one preferred; a stage this
+		 * build has never heard of falls back to the `kind` rule, so an unknown future stage paints
+		 * strictly less than a result rather than throwing.
+		 *
+		 * @param phase - the owner's stage prop, when the host supplies one.
+		 * @param block - the stage block handed to the view.
+		 * @returns {'preparing'|'start'|'result'} the stage to render.
+		 */
+		function stageOf(phase, block) {
+			// `PreparingToolCall` / `StartedToolCall` also carry `phase` themselves, so the block is
+			// consulted only when the owner passed no prop.
+			const onBlock = block !== null && typeof block === "object" && typeof block.phase === "string"
+				? block.phase
+				: null;
+			const declared = typeof phase === "string" ? phase : onBlock;
+			if (declared === "preparing" || declared === "start" || declared === "result") return declared;
+			return block !== null && typeof block === "object" && "kind" in block ? "result" : "start";
+		}
+
 		/** A short one-line summary of what the call asked for. */
 		function summarize(name, args, settled) {
 			if (name === "browser_act") {
@@ -372,12 +406,13 @@ window.__ModuleLoader__.load({
 		 * one. Painting both would show the same picture twice; the frame is therefore dropped from
 		 * the approval block and kept once, under its honest caption.
 		 *
-		 * @param props.block - the frozen running or settled Tool node.
+		 * @param props.phase - the lifecycle stage, when the host declares one (DSH >= 0.2.0-rc.2).
+		 * @param props.block - the frozen stage block: running call or settled result node.
 		 * @param props.callId - the tool call identity, matched against the carrier node.
 		 * @param props.loadImage - session-authorized image loader.
 		 * @param props.useChat - session-scoped selector hook over the Chat target.
 		 */
-		function CuaRow({ block, callId, loadImage, useChat }) {
+		function CuaRow({ phase, block, callId, loadImage, useChat }) {
 			// `tool.call.toolview` is declared `scope: 'session'`, and session-scoped entries get the
 			// session standard kit strictly — a slot rendered without its sources throws at assembly
 			// rather than quietly losing them — so this hook is present whenever the row renders.
@@ -395,7 +430,8 @@ window.__ModuleLoader__.load({
 					children: jsx("div", { style: S.text, children: "browser call (unavailable)" })
 				});
 			}
-			const settled = "kind" in block;
+			const stage = stageOf(phase, block);
+			const settled = stage === "result";
 			const call = settled ? block.call : block;
 			const name = call !== null && typeof call === "object" && typeof call.name === "string"
 				? call.name
@@ -408,15 +444,21 @@ window.__ModuleLoader__.load({
 			const frameIsTheResultItself = approvalImage !== null &&
 				images.some((image) => image.attachmentId === approvalImage.attachmentId);
 
+			// A preparing call has no arguments yet, so there is nothing honest to summarise: the name
+			// alone is painted instead of the "running…" placeholder, which would read as though the
+			// action had already been described.
+			const summary = stage === "preparing" ? null : summarize(name, args, settled);
+			const head = [jsx("span", { style: S.name, children: name })];
+			if (summary !== null && summary !== "") {
+				head.push(jsx("span", { style: S.summary, children: summary }));
+			}
+
 			const children = [
 				jsxs(
 					"div",
 					{
 						style: S.head,
-						children: [
-							jsx("span", { style: S.name, children: name }),
-							jsx("span", { style: S.summary, children: summarize(name, args, settled) })
-						]
+						children: head
 					},
 					"head"
 				)

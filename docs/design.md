@@ -197,13 +197,29 @@ wrong label.
 A `fill`'s text is quoted, whitespace-collapsed and truncated to 40 characters: "type into
 #name-input" does not tell the user what they are approving.
 
-### The sentence follows the UI language
+### The sentence follows the UI language, where the Host still exposes one
 
-The approval reason is one line, built per call from `ctx.get('settings').get('locale').preference`,
-which `@deepseek-ai/dsh-client-locale`'s Host half registers and `dsh-settings-file` (composed by
-`dsh-base`) provides. Only `zh*` selects Chinese; every other value, an absent field, an absent
-namespace, an absent service or a throwing provider resolves to **English**, which is what every other
-string the plugin writes uses.
+The approval reason is one line, built per call. Its language is read from the Host's locale
+preference the documented way: `ctx.get('settings').get('locale').preference`. Only `zh*` selects
+Chinese; every other value, an absent field, an absent namespace, an absent service or a throwing
+provider resolves to **English**, which is what every other string the plugin writes uses.
+
+**DSH 0.2.0-rc.2 removed that channel, and this plugin degrades to English rather than pretending
+otherwise.** In that release `dsh-settings` stopped being a document provider (`SettingsProvider`,
+with `register` / `installSection` / `get` / `section`) and became `SettingsForms` — a
+configuration-form projection whose only methods are `configure` / `describe` / `invalidate` /
+`prepareDocument` / `schema` / `walk`, with **no way to read a namespace's value at all**.
+`@deepseek-ai/dsh-client-locale` followed: `settings.register('locale', …)` became
+`settings.configure({ auto: false }, …)`, and its own comment now says "Host preferences are consumed
+through the configuration form projection". There is therefore no Host-side read left to make, and on
+`0.2.0-rc.2` the reason is English even where the profile declares `preference: zh`. On
+`0.1.5-rc.2`/`rc.3` hosts the preference is still readable and the Chinese sentence still appears.
+
+Because the plugin and any harness that mirrors its read lose the channel *together*, a comparison
+between them cannot detect this. The real-process check in `examples/run-real-dsh-load.mjs` therefore
+takes its expectation from the locale the profile's own `cordis.patch.yml` declares — a fact the
+plugin never sees — and asserts the fallback explicitly, so either a regression or the channel coming
+back fails the run.
 
 The reason carries **only the action description** — no path, no `.png`, no `%d x %d`, no byte count.
 Those facts remain reachable through `approvalScreenshotPath` and the PNG on disk. The card's headline

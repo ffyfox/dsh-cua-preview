@@ -105,8 +105,10 @@ jobs:
       - name: Acceptance suite (real DSH services, real Chrome)
         run: npm run test:acceptance
 
+      # Pinned to the release train the devDependencies target, so the real-process probe boots the
+      # same DSH the in-process suites were resolved against.
       - name: Install the dsh CLI for the real-process probe
-        run: npm install --global @deepseek-ai/dsh@0.1.5-rc.3
+        run: npm install --global @deepseek-ai/dsh@0.2.0-rc.2
 
       - name: Real-process probe (boots the shipped dsh binary)
         run: npm run test:real-load

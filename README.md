@@ -19,13 +19,20 @@ is copied.
 | `browser_screenshot` | no | the current screen as an image |
 
 The read-only pair never raises an approval, because neither can change the page. The gated pair asks
-first, in one line of the UI's own language, and does nothing at all unless the answer is "allow once".
+first, in one line of the UI's own language wherever the Host still exposes that preference, and does nothing at all unless the answer is "allow once".
+
+**That line is always English on DSH `0.2.0-rc.2`**, which removed the Host-side locale read a plugin
+could consult; on `0.1.5-rc.2`/`rc.3` it is localised. [docs/design.md](docs/design.md) has the
+mechanism, and this repository's real-process check asserts the limitation rather than hiding it.
 
 ## Install
 
 Requirements: **Node ≥ 22.12** (this is what `puppeteer-core` requires) and a Chrome or Chromium
 executable. Nothing is downloaded at install time — the plugin drives the Chrome you already have, and
 reports an actionable error instead of silently fetching one.
+
+Developed and verified against DSH `0.2.0-rc.2` (`@deepseek-ai/dsh-tools` `0.2.0-rc.2`,
+`@deepseek-ai/cordis` `4.0.4`), and still supported back to `0.1.5-rc.2`.
 
 A DSH plugin is installed into a **profile** with `dsh plugin`, which forwards its arguments to the
 package manager in that profile's directory:
@@ -138,7 +145,9 @@ Three entries, aimed at three different layers:
 That is **204 checks, 0 failures** — all three entries need `npm install` first. The last entry boots the
 shipped `dsh` binary with the plugin patched in on an OS-assigned free port — so it cannot collide with
 any profile you have running — and runs a probe plugin inside that process which reads the live
-registries. It reports clearly and exits non-zero if no `dsh` CLI is available.
+registries. It reports clearly and exits non-zero if no `dsh` CLI is available. It pins the approval
+policy to `ask` for that boot, so a profile whose default preset is `danger-full-access` cannot turn the
+run into a verdict about the preset instead of about the plugin.
 
 CI runs the Client-bundle verifier and the packaging check on every push, because both are reproducible
 without a browser. The browser suites are not part of that gate — they need a Chrome executable and,

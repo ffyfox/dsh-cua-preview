@@ -9,6 +9,13 @@
  * A temporary profile port is used and the process is stopped afterwards, so the user's running
  * Web UI is never touched.
  *
+ * Two things are pinned on purpose so the verdict describes the **plugin** rather than whichever
+ * preset this machine happens to run: the approval policy is forced to `ask` (a `danger-full-access`
+ * default preset is `approval: never`, under which `ApprovalService.decide()` rejects before the
+ * probe's answerer is ever consulted), and the approval sentence's expected language comes from the
+ * locale the profile's own `cordis.patch.yml` declares rather than from the Host channel the plugin
+ * itself reads.
+ *
  * Usage:  node examples/run-real-dsh-load.mjs
  * Exit code 0 = the real product loaded the plugin and listed all four tools.
  */
@@ -16,11 +23,46 @@
 import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises'
 import { createServer } from 'node:net'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
 const EXPECTED = ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_act']
+const PROFILE = 'web'
+
+/**
+ * Read the locale the profile itself declares.
+ *
+ * This is the one locale fact the plugin cannot move: it is a line in the operator's
+ * `cordis.patch.yml`, not a value read back out of the live Host, so it stays put when the Host
+ * stops exposing that locale to plugins. The probe's own derived comparison reads the same channel
+ * the plugin reads and therefore went green through exactly that failure; the harness compares
+ * against this instead.
+ *
+ * @param patchPath - the profile's `cordis.patch.yml`.
+ * @returns the declared preference id, or null when the profile does not declare one (a fresh CI
+ *   profile has no patch file at all).
+ */
+async function declaredLocaleOf(patchPath) {
+  let text
+  try {
+    text = await readFile(patchPath, 'utf8')
+  } catch {
+    return null
+  }
+  let inLocaleRow = false
+  for (const line of text.split('\n')) {
+    const row = /^\s*-\s*id:\s*(\S+)\s*$/.exec(line)
+    if (row !== null) {
+      inLocaleRow = row[1] === 'locale'
+      continue
+    }
+    if (!inLocaleRow) continue
+    const preference = /^\s*preference:\s*(\S+)\s*$/.exec(line)
+    if (preference !== null) return preference[1].replace(/^["']|["']$/g, '')
+  }
+  return null
+}
 
 /**
  * Ask the OS for a free port.
@@ -53,7 +95,42 @@ const verdictPath = join(workDir, 'verdict.json')
 const overlayPath = join(workDir, 'cordis.patch.yml')
 const logPath = join(workDir, 'boot.log')
 
+const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+const declaredLocale = await declaredLocaleOf(join(dshHome, 'profiles', PROFILE, 'cordis.patch.yml'))
+
+const probeConfig = [
+  `        resultPath: '${verdictPath}'`,
+  '        timeoutMs: 45000',
+  '        exitAfter: true',
+]
+if (declaredLocale !== null) probeConfig.push(`        declaredLocale: '${declaredLocale}'`)
+
+// The two patched rows above `insert` override the operator's permission settings for this
+// verification boot only, and they are load-bearing rather than cosmetic: the shipped `approval` row
+// derives its policy from `DSH_PERMISSION_MODE`, and a `web` profile that switches the default preset
+// to `danger-full-access` gets `approval: never`. Under `never`, `ApprovalService.decide()` returns
+// "rejected" *before* the `approval/request` waterfall, so the probe's own answerer is never called
+// and the gated action can never be approved. Pinning the policy to `ask` keeps this check about the
+// plugin rather than about whichever preset the operator happens to run.
 const overlay = `# Temporary overlay: the plugin under test plus a probe that reports the live tool registry.
+- id: approval
+  name: '@deepseek-ai/dsh-user-approval'
+  config:
+    policy: ask
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: ask
+    defaultPreset: workspace-write
 - insert:
     - id: cua-preview
       name: '${join(root, 'src/index.js')}'
@@ -63,19 +140,18 @@ const overlay = `# Temporary overlay: the plugin under test plus a probe that re
     - id: cua-preview-load-probe
       name: '${join(root, 'examples/load-probe.plugin.mjs')}'
       config:
-        resultPath: '${verdictPath}'
-        timeoutMs: 45000
-        exitAfter: true
+${probeConfig.join('\n')}
 `
 await writeFile(overlayPath, overlay)
 
 console.log('booting the real dsh web profile with the plugin patched in...')
-console.log(`  overlay: ${overlayPath}`)
-console.log(`  port:    ${PROBE_PORT} (OS-assigned; the user's GUI is untouched)\n`)
+console.log(`  overlay:        ${overlayPath}`)
+console.log(`  port:           ${PROBE_PORT} (OS-assigned; the user's GUI is untouched)`)
+console.log(`  declared locale: ${declaredLocale ?? '(none declared in this profile)'}\n`)
 
 const child = spawn(
   'dsh',
-  ['--profile', 'web', '--patch', overlayPath, '--port', String(PROBE_PORT), '--no-open'],
+  ['--profile', PROFILE, '--patch', overlayPath, '--port', String(PROBE_PORT), '--no-open'],
   { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] },
 )
 
@@ -159,6 +235,46 @@ const checks = [
   ['the refusal still carries the approval-time frame to the model',
     verdict.refusalCarriesTheApprovalFrame === true, 'an image block survives the refusal'],
 ]
+
+// --- the approval sentence's language, asserted against something the plugin cannot move ---------
+//
+// `verdict.approvalReasonMatchesExpectedWording` is deliberately NOT used below: it compares two
+// readings of the same Host channel, so when DSH 0.2.0-rc.2 removed that channel the plugin and the
+// probe fell to English together and the comparison stayed true. The expectation here is
+// `declaredLocale`, parsed out of the profile's own `cordis.patch.yml` — a fact the plugin never sees.
+
+const channelReadable = verdict.localeChannelReadable === true
+const reasonLanguage = verdict.approvalReasonLanguage === 'zh' ? 'zh' : 'en'
+const declaredLanguage = verdict.declaredLocaleLanguage ?? null
+
+checks.push(
+  ['the approval sentence is one of the two known exact wordings, not a half-localised string',
+    verdict.approvalReasonWordingIsExact === true, JSON.stringify(verdict.approvalReason)],
+  ['the sentence\'s language is the language the Host actually exposes',
+    verdict.approvalReasonLanguageMatchesTheHostChannel === true,
+    `localePreference=${JSON.stringify(verdict.localePreference)} sentence=${reasonLanguage}`],
+)
+
+if (declaredLanguage === null) {
+  checks.push(
+    ['no profile locale is declared here, so the live channel is the only constraint on the sentence',
+      reasonLanguage === (channelReadable ? reasonLanguage : 'en'),
+      `channelReadable=${channelReadable} — a fresh CI profile has no cordis.patch.yml`],
+  )
+} else if (channelReadable) {
+  checks.push(
+    [`the profile declares ${verdict.declaredLocale}, the Host exposes it, so the sentence is ${declaredLanguage}`,
+      reasonLanguage === declaredLanguage, `sentence=${reasonLanguage}`],
+  )
+} else {
+  checks.push(
+    [`the profile declares ${verdict.declaredLocale} but this DSH no longer exposes a Host locale `
+      + 'channel, so the sentence is English by design and not half-localised',
+      reasonLanguage === 'en' && verdict.approvalReasonLanguageMatchesDeclaredLocale === false,
+      `sentence=${reasonLanguage} — if this FAILS because the channel came back, restore the `
+      + 'localised expectation and drop this known limitation from the docs'],
+  )
+}
 
 let failed = 0
 for (const [name, ok, detail] of checks) {
