@@ -23,8 +23,10 @@
  * The enforcing method itself is out of reach here: the API gateway provides `sessionController`
  * inside its own isolation scope, so neither `ctx.get('sessionController')` nor
  * `ctx.get('sessionController', false)` resolves it from a root-level patch row, and Cordis exposes
- * no downward fiber walk. The probe therefore asserts the plugin-owned half — the event and its
- * position — rather than pretending to call the Host's method.
+ * no downward fiber walk. The probe therefore asserts what the plugin itself controls — that both
+ * frames are image blocks referenced from the content array of a committed event, and that the log
+ * holds no event type outside the harness vocabulary — rather than pretending to call the Host's
+ * method.
  *
  * Configure with:
  *   resultPath  - where to write the JSON verdict (required)

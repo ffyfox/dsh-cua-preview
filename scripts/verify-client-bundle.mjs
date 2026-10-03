@@ -145,7 +145,8 @@ check(
   toolRows.map((r) => r.config.key).sort().join(',') === 'browser_act,browser_navigate,browser_screenshot',
   toolRows.map((r) => r.config.key).join(', '),
 )
-// The carrier node is hidden, so the chat never dispatches a renderer for its kind: registering one
+// This bundle owns no node to render: the frame reaches the call's own row through the call's result
+// content and the exact-Fetch route, so there is no node kind for a renderer to serve here — one
 // would be dead code, and a keyed seat in `conversation.chat.node` is not needed to own state.
 check('it registers no Chat node renderer at all',
   chatNodeEntry === undefined,
@@ -192,7 +193,8 @@ check('nothing in this package appends a Session event',
 // Shipped owners of the slots this bundle touches, recorded here so a future edit cannot quietly
 // re-claim one: `tool.call.toolview` is `keyed` (per-tool keys) and is the only slot this plugin
 // registers into; `conversation.chat.node` is `keyed` per node kind but is deliberately NOT used,
-// because the carrier node is hidden and a hidden node never reaches that seat;
+// because this bundle owns no node to render — the earlier revision's hidden carrier is gone and
+// nothing replaced it;
 // `conversation.approval.detail` is `single` with a shipped occupant.
 
 const ALLOWED_SLOTS = new Set(['tool.call.toolview'])
