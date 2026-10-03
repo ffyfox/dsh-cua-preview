@@ -152,7 +152,9 @@ What the live frame costs, stated rather than hidden:
   result then carries the same picture, and the held entry expires on its own if a call dies mid-ask.
 - **It is one more public surface.** A `GET`/`HEAD` route on the Host's `/api`, admitted only through the
   browser-session trust boundary, marked `no-store`, registered inside an effect so unloading withdraws
-  it, and skipped entirely on a Host that mounts no such registry.
+  it, and skipped entirely on a Host that mounts no such registry. The Host registers the absolute path;
+  the Client fetches the document-relative one (`FRAME_ROUTE.slice(1)`), which is what every shipped
+  Client does with its own route and the form that survives a document served under a path prefix.
 - **The row has to ask again.** The first ask normally lands before the capture exists; the provider
   retries with a bounded backoff until the frame is there, the resource is released, or the window ends.
 

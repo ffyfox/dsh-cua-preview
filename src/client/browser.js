@@ -125,6 +125,20 @@ window.__ModuleLoader__.load({
 		/** The exact Fetch route the Host registers for those frames. */
 		const FRAME_ROUTE = "/api/cua-preview.frame";
 
+		/**
+		 * The same route as the browser must ask for it: document-relative, without the leading slash.
+		 *
+		 * The Host registers the absolute path; a Client fetches the relative one, because that is what
+		 * every shipped Client does with its own route — `dsh-client-file-upload` writes
+		 * `"/api/session/uploadFileBinary".slice(1)`, and `dsh-client-ui-deliverables` keeps a
+		 * `…_ROUTE` beside each `…_PATH` for the same reason, naming
+		 * `.agents/notes/implemented/architecture/2026-09-14-web-document-relative-app-routes.md`. In
+		 * today's shells the document sits at the origin root (`dsh-app://app/` in the Desktop app), so
+		 * both forms resolve to one URL and the difference is invisible; the relative form is the one
+		 * that survives a document served under a path prefix.
+		 */
+		const FRAME_FETCH_ROUTE = FRAME_ROUTE.slice(1);
+
 		/** The query parameter naming the tool call whose frame is wanted. */
 		const FRAME_CALL_ID = "callId";
 
@@ -559,7 +573,7 @@ window.__ModuleLoader__.load({
 						if (signal?.aborted === true) return;
 						let response;
 						try {
-							response = await fetch(`${FRAME_ROUTE}?${FRAME_CALL_ID}=${encodeURIComponent(callId)}`, {
+							response = await fetch(`${FRAME_FETCH_ROUTE}?${FRAME_CALL_ID}=${encodeURIComponent(callId)}`, {
 								signal,
 								cache: "no-store"
 							});

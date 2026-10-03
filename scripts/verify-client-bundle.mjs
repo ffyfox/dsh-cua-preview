@@ -279,8 +279,10 @@ const frameAddr = (callId) => exportsValue.frameAddress(callId)
   })
   check('a 404 is read as "not captured yet", so the provider asks again',
     requests.length === 2 && error === null, `requests=${requests.length} error=${String(error)}`)
-  check('  ↳ the ask names the call on the documented route',
-    requests[0] === '/api/cua-preview.frame?callId=call-1', String(requests[0]))
+  check('  ↳ the ask names the call on the documented route, in the shipped document-relative form',
+    requests[0] === 'api/cua-preview.frame?callId=call-1', String(requests[0]))
+  check('  ↳ the registered path stays absolute: only the browser fetch drops the leading slash',
+    exportsValue.FRAME_ROUTE === '/api/cua-preview.frame', String(exportsValue.FRAME_ROUTE))
   check('  ↳ the frame is yielded exactly once, as a URL the row can render',
     frames.length === 1 && frames[0]?.ok === true && typeof frames[0]?.value?.url === 'string',
     JSON.stringify({ frames: frames.length, value: frames[0]?.value }))

@@ -21,6 +21,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Client verifier asserts that the loading paint and the loaded paint are the same box, and the acceptance
   harness measures it in a real browser — a reserved box is 402 px tall and decoding the bytes leaves it
   at 402 px, while the old two-step paint moves the row from 42 px to 402 px.
+- **The Client now fetches the frame route in the shipped document-relative form.** The Host registers
+  `/api/cua-preview.frame`; the Client asks for `api/cua-preview.frame`. Every shipped Client does this
+  with its own route (`"/api/session/uploadFileBinary".slice(1)` in `dsh-client-file-upload`, a `…_ROUTE`
+  beside each `…_PATH` in `dsh-client-ui-deliverables`). In today's shells the document sits at the origin
+  root, so both forms resolve to one URL and the difference is invisible — which is exactly why a live
+  test could not have caught it; the relative form is the one that survives a document served under a
+  path prefix.
 - **A gated action made its own session unopenable, and the plugin no longer writes to the Session log at
   all.** The approval-time frame used to be referenced from a plugin-owned `cua/preview` session event.
   That type is outside the harness's `KNOWN_SESSION_EVENT_TYPES`, and the envelope's `ignorable: true`
