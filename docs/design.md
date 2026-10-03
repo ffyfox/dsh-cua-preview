@@ -218,6 +218,23 @@ mid-update. The alternative — silently returning a possibly-stale frame while 
 promises "the action's effect" — is a claim the plugin cannot support. Setting `settle: false` skips the
 wait entirely and reports **no** `settled` field at all, for the same reason.
 
+### A dead browser must not poison the rest of the session
+
+`BrowserController` caches one browser and one page for the whole plugin lifetime, and the cached pair
+used to be believed unconditionally. Once the Chrome process goes away — a crash, the OOM killer, a
+`SIGKILL`, a closed window — every later call failed with `Attempted to use detached Frame` until the
+plugin was reloaded. `page.isClosed()` is *not* the signal that catches this: measured against a
+`SIGKILL`ed Chrome it still returned `false` while every call failed. `browser.connected` does return
+`false`, so that is what `#dropDead` checks; a live browser with a closed tab is handled separately by
+taking another tab instead of launching a second browser.
+
+Operations that **cannot** have produced a side effect — snapshot, element description, screenshot,
+screen probe, and navigation (re-navigating is harmless) — are retried once against a re-established
+page. `click`, `fill` and `submit` deliberately are **not** retried: replaying an input whose delivery
+is unknown can double-act on the page, so the honest answer to the caller is that the outcome is
+unknown. A stale `page` handle held by *someone else* (a harness, a future caller) is not repaired by
+this and cannot be.
+
 ### A blank screen emits no frame
 
 The credential frame of a *first* navigation is genuinely a blank tab — 1,280×800, 4,714 bytes, md5

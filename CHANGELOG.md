@@ -77,6 +77,18 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the result says so instead of the plugin claiming more than it verified; with `settle: false` the
   fields are absent entirely.
 
+### Fixed
+
+- **A browser that died no longer poisons the rest of the session.** The cached browser/page pair was
+  believed unconditionally, so once Chrome went away (crash, OOM killer, `SIGKILL`, closed window) every
+  later call failed with `Attempted to use detached Frame` until the plugin was reloaded — including
+  read-only calls that raise no approval. The cache is now validated with `browser.connected` before
+  reuse, and a live browser whose tab was closed gets another tab instead of a second browser.
+  `page.isClosed()` is deliberately not the signal: measured against a `SIGKILL`ed Chrome it still
+  returned `false` while every call failed. Operations that cannot have produced a side effect — and
+  navigation, which is harmless to repeat — are retried once against a re-established page; `click`,
+  `fill` and `submit` are not, because replaying an input whose delivery is unknown can double-act.
+
 ### Changed
 
 - **A granted action now returns both frames, and the row captions each by role.** The approval-time

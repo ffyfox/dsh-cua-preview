@@ -18,7 +18,7 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import puppeteer from 'puppeteer-core'
+import puppeteer, { ConnectionClosedError, TargetCloseError } from 'puppeteer-core'
 
 /**
  * Candidate Chrome/Chromium executables, most-specific first.
@@ -71,6 +71,26 @@ export const SETTLE_DEFAULTS = Object.freeze({
 
 /** How often the DOM signature is sampled while waiting for the page to stop changing. */
 const SETTLE_POLL_MS = 150
+
+/**
+ * Whether an error proves the page or browser is GONE, as opposed to the call being wrong.
+ *
+ * `TargetCloseError` and `ConnectionClosedError` are puppeteer's own exported error classes, so
+ * the closed-target cases are typed. The detached-frame case is a plain `Error` from puppeteer's
+ * `throwIfDisposed` (`lib/puppeteer/util/decorators.js`), so its wording is what identifies it —
+ * and it is the message that actually appears when the browser process is killed.
+ *
+ * Deliberately NOT included: the bare `ProtocolError` parent. It also covers ordinary protocol
+ * failures (a bad parameter, an unknown method), and relaunching the browser for those would hide
+ * a real bug instead of recovering from a dead one.
+ *
+ * @param {unknown} error - the thrown value.
+ * @returns {boolean} whether the page/browser must be re-established.
+ */
+function pageIsGone(error) {
+  if (error instanceof TargetCloseError || error instanceof ConnectionClosedError) return true
+  return error instanceof Error && error.message.startsWith('Attempted to use detached Frame')
+}
 
 export class BrowserUnavailableError extends Error {
   constructor(message) {
@@ -129,12 +149,22 @@ export class BrowserController {
    * Launch Chrome if it is not already running, and return the shared page.
    *
    * Concurrent callers share one launch: the in-flight promise is memoized so two tool calls
-   * arriving together cannot start two browsers.
+   * arriving together cannot start two browsers. The cache is validated before it is reused so a
+   * browser that died (crash, OOM, SIGKILL, a closed window) is replaced instead of poisoning every
+   * later call — see {@link BrowserController#dropDead}.
    *
    * @returns {Promise<import('puppeteer-core').Page>}
    */
   async page() {
+    this.#dropDead()
     if (this.#page !== undefined) return this.#page
+    if (this.#browser !== undefined) {
+      // The browser is alive but our page is gone (its tab was closed). Reuse the browser and take
+      // another tab rather than paying for a second browser process.
+      const pages = await this.#browser.pages()
+      this.#page = pages[0] ?? (await this.#browser.newPage())
+      return this.#page
+    }
     if (this.#launching !== undefined) return this.#launching
     this.#launching = this.#launch()
     try {
@@ -142,6 +172,47 @@ export class BrowserController {
       return this.#page
     } finally {
       this.#launching = undefined
+    }
+  }
+
+  /**
+   * Forget a cached browser or page that is provably dead.
+   *
+   * `browser.connected` is the signal that works, and `page.isClosed()` is not: measured against a
+   * SIGKILLed Chrome, `isClosed()` still returned `false` while every call failed with
+   * `Attempted to use detached Frame`. Trusting `isClosed()` alone leaves exactly the failure this
+   * guard exists to fix. The browser handle is dropped without `close()` — the connection is gone,
+   * so there is nothing to close and the call would only hang or throw.
+   */
+  #dropDead() {
+    if (this.#browser !== undefined && this.#browser.connected !== true) {
+      this.#browser = undefined
+      this.#page = undefined
+      return
+    }
+    if (this.#page !== undefined && this.#page.isClosed() === true) this.#page = undefined
+  }
+
+  /**
+   * Run an operation against the live page, re-establishing it once if it died mid-call.
+   *
+   * Only used by operations that CANNOT have produced a side effect: a snapshot, an element
+   * description, a screenshot, a screen probe, and a navigation (re-navigating is harmless). The
+   * gated actions — click, fill, submit — are deliberately NOT retried: a replay of an input whose
+   * delivery is unknown can double-act on the page, and the honest answer to the caller is that the
+   * outcome is unknown.
+   *
+   * @param {(page: import('puppeteer-core').Page) => Promise<unknown>} operation - work to run.
+   * @returns {Promise<unknown>} the operation's result.
+   */
+  async #withLivePage(operation) {
+    const page = await this.page()
+    try {
+      return await operation(page)
+    } catch (error) {
+      if (!pageIsGone(error)) throw error
+      this.#dropDead()
+      return operation(await this.page())
     }
   }
 
@@ -167,10 +238,11 @@ export class BrowserController {
    * @returns {Promise<{url: string, title: string, status: number|null}>}
    */
   async navigate(url, signal) {
-    const page = await this.page()
-    signal?.throwIfAborted()
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-    return { url: page.url(), title: await page.title(), status: response?.status() ?? null }
+    return this.#withLivePage(async (page) => {
+      signal?.throwIfAborted()
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+      return { url: page.url(), title: await page.title(), status: response?.status() ?? null }
+    })
   }
 
   /**
@@ -187,8 +259,7 @@ export class BrowserController {
    * @returns {Promise<object|null>} element facts, or null when the selector matches nothing.
    */
   async describe(selector) {
-    const page = await this.page()
-    return page.evaluate((css) => {
+    return this.#withLivePage((page) => page.evaluate((css) => {
       const el = document.querySelector(css)
       if (el === null) return null
       const rect = el.getBoundingClientRect()
@@ -238,7 +309,7 @@ export class BrowserController {
         disabled: el.disabled === true,
         rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       }
-    }, selector)
+    }, selector))
   }
 
   /**
@@ -305,9 +376,10 @@ export class BrowserController {
    * @returns {Promise<{url: string, title: string, text: string}>}
    */
   async snapshot() {
-    const page = await this.page()
-    const text = await page.evaluate(() => (document.body?.innerText ?? '').replace(/\s+/gu, ' ').trim())
-    return { url: page.url(), title: await page.title(), text: text.slice(0, 4000) }
+    return this.#withLivePage(async (page) => {
+      const text = await page.evaluate(() => (document.body?.innerText ?? '').replace(/\s+/gu, ' ').trim())
+      return { url: page.url(), title: await page.title(), text: text.slice(0, 4000) }
+    })
   }
 
   /**
@@ -327,17 +399,18 @@ export class BrowserController {
    * @returns {Promise<{url: string, blank: boolean}>}
    */
   async screenState() {
-    const page = await this.page()
-    const url = page.url()
-    const unloaded = url === '' || url === 'about:blank'
-    if (!unloaded) return { url, blank: false }
-    const empty = await page.evaluate(() => {
-      const body = document.body
-      if (body === null) return (document.documentElement?.textContent ?? '').trim() === ''
-      if (body.childElementCount > 0) return false
-      return (body.textContent ?? '').trim() === ''
+    return this.#withLivePage(async (page) => {
+      const url = page.url()
+      const unloaded = url === '' || url === 'about:blank'
+      if (!unloaded) return { url, blank: false }
+      const empty = await page.evaluate(() => {
+        const body = document.body
+        if (body === null) return (document.documentElement?.textContent ?? '').trim() === ''
+        if (body.childElementCount > 0) return false
+        return (body.textContent ?? '').trim() === ''
+      })
+      return { url, blank: empty }
     })
-    return { url, blank: empty }
   }
 
   /**
@@ -424,7 +497,9 @@ export class BrowserController {
       let signature
       try {
         signature = await this.#signature()
-      } catch {
+      } catch (error) {
+        // A page that is gone is the caller's problem to recover from, not a stability signal.
+        if (pageIsGone(error)) throw error
         signature = `unreadable:${Date.now()}`
       }
       if (signature === previous) {
@@ -449,8 +524,7 @@ export class BrowserController {
    * @returns {Promise<string>} the signature.
    */
   async #signature() {
-    const page = await this.page()
-    return page.evaluate(() => {
+    return this.#withLivePage((page) => page.evaluate(() => {
       const body = document.body
       const text = body === null ? '' : (body.textContent ?? '')
       let hash = 2166136261
@@ -465,7 +539,7 @@ export class BrowserController {
         text.length,
         hash,
       ].join('|')
-    })
+    }))
   }
 
   /**
@@ -482,20 +556,21 @@ export class BrowserController {
    * @returns {Promise<{path: string, mimeType: string, byteLength: number, width: number, height: number, data: Buffer}>}
    */
   async screenshotToFile({ directory, name }) {
-    const page = await this.page()
-    const data = Buffer.from(await page.screenshot({ type: 'png', encoding: 'base64' }), 'base64')
-    const path = join(directory, name)
-    await mkdir(dirname(path), { recursive: true })
-    await writeFile(path, data)
-    const viewport = page.viewport() ?? { width: 0, height: 0 }
-    return {
-      path,
-      mimeType: 'image/png',
-      byteLength: data.byteLength,
-      width: viewport.width,
-      height: viewport.height,
-      data,
-    }
+    return this.#withLivePage(async (page) => {
+      const data = Buffer.from(await page.screenshot({ type: 'png', encoding: 'base64' }), 'base64')
+      const path = join(directory, name)
+      await mkdir(dirname(path), { recursive: true })
+      await writeFile(path, data)
+      const viewport = page.viewport() ?? { width: 0, height: 0 }
+      return {
+        path,
+        mimeType: 'image/png',
+        byteLength: data.byteLength,
+        width: viewport.width,
+        height: viewport.height,
+        data,
+      }
+    })
   }
 
   /** Close the browser and release the page. Safe to call when nothing is open. */
@@ -503,6 +578,14 @@ export class BrowserController {
     const browser = this.#browser
     this.#browser = undefined
     this.#page = undefined
-    if (browser !== undefined) await browser.close()
+    // A browser that is already gone has nothing to close, and asking it to would hang or throw
+    // during teardown — the one place an exception helps nobody.
+    if (browser !== undefined && browser.connected === true) {
+      try {
+        await browser.close()
+      } catch {
+        // The process died between the check and the close; teardown is still complete.
+      }
+    }
   }
 }
