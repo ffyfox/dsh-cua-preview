@@ -5,8 +5,36 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **A gated action made its own session unopenable, and the plugin no longer writes to the Session log at
+  all.** The approval-time frame used to be referenced from a plugin-owned `cua/preview` session event.
+  That type is outside the harness's `KNOWN_SESSION_EVENT_TYPES`, and the envelope's `ignorable: true`
+  marker — the one mechanism that makes an out-of-repo event safely skippable — cannot be set by a live
+  writer: `Session.append(type, data, opts)` copies only `sourceEventSeqs` and `surfaceOp` out of `opts`.
+  Every session that had run a gated action therefore landed on disk with an unknown, *required* event,
+  and the persistence reader refused it from then on: *"contains event type \"cua/preview\" (seq 9403)
+  unknown to this harness and not marked ignorable; refusing to interpret the log"*. The visible effect
+  was a conversation whose history would not load after a harness restart, while the host kept appending
+  to the same log. The plugin now appends nothing; the frame reaches the Client through the call's own
+  `tool/result` content, which is a known event type the Host authorizes. Also present in `0.1.0`.
+- **The suite now fails if this reappears.** `scripts/verify-client-bundle.mjs` rejects any `.append(` in
+  `src/` (comments stripped, so documentation that names the API is not mistaken for a call to it) and
+  any dependency on the Conversation event service; the acceptance harness asserts that every event in
+  the live log is inside `KNOWN_SESSION_EVENT_TYPES` and that only the harness's own types appear; and the
+  real-product probe reports the same two facts from a log the shipped `dsh` binary wrote. The defect
+  survived a release because nothing had ever looked at the log the plugin produced.
+
 ### Changed
 
+- **A granted action now returns both frames, and the row captions each by role.** The approval-time
+  frame is no longer a separate session event (see `Fixed`): it is the *first* image block of the
+  granted result, followed by the post-action frame, and `presentationMeta` gained `frames`
+  (`['before','after']`, `['before']` on a refusal or when the post-action capture failed) so the Client
+  never has to infer a caption from an image's position or from `granted` alone. The row therefore paints
+  `before the action` above `after the action`, and a legacy result without `frames` still captions its
+  single frame the way the build that wrote it did. Nothing the plugin shows is carried by a session event
+  of its own any more: once the call returns, the row paints the frames from the call's own result.
 - **Adapted to DSH `0.2.0-rc.2`.** The development dependencies now track that release train
   (`@deepseek-ai/dsh-*` `0.2.0-rc.2`, `@deepseek-ai/cordis` `4.0.4`, `@deepseek-ai/cordis-plugin-loader`
   `1.0.5`, `@deepseek-ai/schemastery` `3.18.4`), and the obsolete `@deepseek-ai/dsh-code-runtime` dev

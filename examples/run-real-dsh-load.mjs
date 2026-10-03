@@ -195,29 +195,37 @@ const checks = [
     verdict.approvalServicePresent === true, String(verdict.approvalServicePresent)],
   ['the attachment service is mounted in the real web profile',
     verdict.attachmentsServicePresent === true, String(verdict.attachmentsServicePresent)],
-  // The frame below is read off the real Session log the product wrote. The enforcement point
+  // The frames below are read off the real Session log the product wrote. The enforcement point
   // (`sessionController.attachment`, reached by the browser's image loader) lives in the API
   // gateway's isolation scope and cannot be called from a root-level patch row — so this asserts the
-  // plugin-owned half: the event exists, it is log-only, and it carries the reference in the exact
-  // position that authorization scans.
+  // shape that authorization needs: both frames referenced from a content array of a committed
+  // event, and the log holding no event type this harness does not know.
   ['a real gated click was approved and ran',
-    verdict.actionGranted === true, `decision=${verdict.approvalDecision}`],
+    verdict.actionGranted === true, `decision=${String(verdict.approvalDecision)}`],
   ['a real blank first navigation carries no credential frame',
     verdict.blankNavigationOmittedFrame === true, 'no approvalImage / approvalScreenshotPath'],
   ['the approval reason is a single line and carries no path',
     typeof verdict.approvalReason === 'string' &&
       !verdict.approvalReason.includes('\n') && !verdict.approvalReason.includes('.png'),
     JSON.stringify(verdict.approvalReason)],
-  ['the real Session log references the approved frame',
-    verdict.credentialReferenced === true, `attachment=${verdict.credentialAttachmentId}`],
-  ['that reference sits in the position the Host authorizer scans',
-    verdict.referenceIsInScannedPosition === true, 'data.content[0]'],
-  ['the plugin wrote exactly one cua/preview event, and it is log-only',
-    verdict.previewEventsInSessionLog === 1 && verdict.previewEventIsLogOnly === true,
-    `cua/preview events=${verdict.previewEventsInSessionLog} logOnly=${verdict.previewEventIsLogOnly}`],
-  ['that event carries the call id the approval panel joins on',
-    verdict.previewEventCallId === 'cua-preview-probe-call' && verdict.previewEventAction === 'click',
-    `callId=${String(verdict.previewEventCallId)} action=${String(verdict.previewEventAction)}`],
+  ['the granted result carries both frames, the approved one first',
+    verdict.frameCount === 2 && verdict.framesAreDistinct === true,
+    `frames=${verdict.frameCount} distinct=${verdict.framesAreDistinct}`],
+  // The frames have to be image blocks, because that is the block the agent loop persists and the
+  // block `imageInEvent` scans for. `ctx.tools.execute` validates and materializes the result but
+  // does not log `tool/result` itself, so the persisted-log half of this property is pinned by the
+  // in-process acceptance harness; this half is pinned here against the shipped pipeline.
+  ['both frames are image blocks carrying real durable references',
+    verdict.framesAreImageBlocks === true, 'type:"image" with ImageAttachmentRef attachments'],
+  // The defect this replaced: a plugin-owned `cua/preview` event made every session that ran a gated
+  // action unreadable ("unknown to this harness and not marked ignorable"). Both halves are checked
+  // in the real product, because a green plugin-side test could not see the log at all.
+  ['the plugin writes no event type outside the harness vocabulary',
+    Array.isArray(verdict.unknownEventTypes) && verdict.unknownEventTypes.length === 0,
+    `unknown=${JSON.stringify(verdict.unknownEventTypes)}`],
+  ['the plugin appends nothing of its own to the Session log',
+    verdict.pluginAppendedNoEvent === true,
+    `events=${JSON.stringify(verdict.sessionEventTypes)}`],
   ['an unreferenced attachment is not referenced (the control)',
     verdict.unreferencedRefused === true, 'bogus id absent from the log'],
   // The refusal path, in the real product and through the real pipeline. A direct `execute()` call

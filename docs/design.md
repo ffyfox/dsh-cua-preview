@@ -38,8 +38,8 @@ Both are kept, each named for what it is:
 
 | Frame | Written as | Where it goes |
 |---|---|---|
-| Approval-time (pre-action) | `approval-*.png` | the user's card, and `approvalScreenshotPath` for audit |
-| Result (post-action) | `after-*.png` | the model-facing `output.render` image block |
+| Approval-time (pre-action) | `approval-*.png` | the result's first image block, captioned `before the action`; also `approvalScreenshotPath` for audit |
+| Result (post-action) | `after-*.png` | the result's second image block, captioned `after the action` |
 
 The tool descriptions state this, so the rule is in the system prompt rather than being tribal
 knowledge. On a **refusal** there is no post-action state to show, so the single returned frame *is*
@@ -48,107 +48,59 @@ the approval-time frame, captioned `at approval time (no action ran)`.
 ## Where an image can travel, and where it cannot
 
 `ApprovalRequest` carries `agent`, `toolName`, `callId`, `reason` and `signal` — **there is no image
-field**, and none is invented. The documented channels that do carry an image are:
+field**, and none is invented. The channels that carry an image are:
 
 | Channel | Mechanism | Used for |
 |---|---|---|
-| Model-facing result | `output.render` → an `{ type: 'image', attachment }` block | the post-action frame |
-| Result-time card data | `output.presentationMeta(args, value)` → persisted on `tool/result` as `result.meta` | audit pointer (`granted`, `decision`, `approvedFrame`, `approvedPath`) |
-| A plugin-owned session event | `session.append('cua/preview', …)` | the approval-time frame, so the Client can read it |
+| Result content | `output.render` → `{ type: 'image', attachment }` blocks | both frames: the approval-time one first, then the post-action one |
+| Result-time card data | `output.presentationMeta(args, value)` → persisted on `tool/result` as `result.meta` | which frame is which (`frames`), plus the audit pointers (`granted`, `decision`, `approvedPath`) |
+| ~~A plugin-owned session event~~ | `session.append('<plugin type>', …)` | **not available** — see below |
+
+### A plugin may not append its own session event type
+
+The envelope's `ignorable?: true` marker exists precisely for out-of-repo plugin events
+(`.agents/notes/implemented/architecture/2026-08-30-retain-ignorable-external-session-events.md`): the
+persistence reader refuses to interpret a stored log containing an unknown type *unless that stored
+record* carries the marker. A live writer cannot set it — `Session.append(type, data, opts)` copies only
+`sourceEventSeqs` and `surfaceOp` out of `opts` into the envelope — so a plugin-owned event type lands on
+disk unmarked, and every session that ever ran a gated action refuses to reopen:
+
+```text
+failed to observe session "…": session "…" contains event type "cua/preview" (seq 9403) unknown to this
+harness and not marked ignorable; refusing to interpret the log — it was likely written by a newer
+harness
+```
+
+The plugin-author rule says the same thing
+(`dsh-agent-preset/skills/cordis-plugin-development/references/practices.md`): "Do not append session
+events with a new `type` … live `Session.append()` cannot set that marker, so the Session would refuse to
+reopen. Derive state from existing events, or keep plugin-owned data in a storage service found through
+inspection." Version 0.1.0 of this plugin appended one; removing it is the fix, and
+`scripts/verify-client-bundle.mjs` now fails on any `.append(` that reappears under `src/`.
 
 ### `result.meta` describes an image but does not make it readable
 
 The Host proves reachability **before** serving attachment bytes: `dsh-api-session-controller`'s
 `attachment()` looks the reference up through `referencedImage` → `imageInEvent`, which scans exactly
 `data.content`, `data.message.content`, `data.inserted[].content` and assistant-stream chunks. A
-reference carried only in `result.meta` is in none of those positions, so a card told about the
-credential by `meta` alone renders its caption and then *"screenshot could not be loaded"*.
+reference carried only in `result.meta` is in none of those positions, so a card told about the frame by
+`meta` alone renders its caption and then *"screenshot could not be loaded"*. The frames therefore ride
+in the call's own result content, and `meta.frames` says which is which.
 
-The fix uses the mechanism DSH provides for this: a **log-only** plugin event (a declaration-merged
-`SessionEventMap` type that is not a `SurfaceEventType`, and therefore contributes nothing to derived
-history). Its payload puts the reference where the authorizer scans:
+## The frames on screen once the call has settled
 
-```js
-session.append('cua/preview', {
-  content: [{ type: 'image', attachment: ref }],
-  callId, action, toolName,          // the client joins on callId
-})
-```
-
-Two properties come out of this at once: the Client can read the frame, and the model still never
-sees it.
-
-### `result.meta` is also not what the row paints
-
-The tool row paints the **audit pointer never**, and reads `content` and `meta` only once the call has
-settled (`"kind" in block`), because neither exists while it runs and DSH exposes no tool-progress
-API. So a credential painted by the row alone could only ever appear *after* the user had already
-answered — the opposite of the point. That is why the credential is read out of the plugin's own
-event instead (below), and the row is left showing exactly its own result.
-
-## Getting the credential on screen while the approval is pending
-
-The shipped approval panel declares `conversation.approval.detail` and renders it inside the card
-above the decision buttons — an ideal place for the credential. It is **not available to a plugin**:
-it is a `single` slot, and `@deepseek-ai/dsh-client-ui-chat` already registers `ApprovalCommand` into
-it at priority 0. `SlotCore.register` throws when a second entry claims the same priority, and the
-throw lands in whichever plugin registers second — which was the shipped `ui-chat`, failing the whole
-client plugin set:
-
-```text
-Failed to load plugins
-@deepseek-ai/dsh-client-ui-chat
-single slot "conversation.approval.detail" already has a registration at priority 0
-(registered by Ba) — register at a different priority to shadow it (lowest renders)
-```
-
-Registering at a lower priority would *shadow* the shipped occupant, deleting the pending call's
-command preview from the approval card for every tool — a global regression traded for a plugin-local
-feature. So the region is left alone, and the plugin's own Conversation node is the channel.
-
-### The carrier node
-
-`src/client/browser.js` registers a Definition for the `cua/preview` event that publishes a
-`{ kind: 'cua-preview', target: 'chat' }` node anchored on the event's `seq`. Two platform facts make
-this work, both read out of shipped code:
-
-| Question | Answer |
-|---|---|
-| Is a hidden node still materialized? | Yes — `ChatSnapshot.nodes` is a `ChatNodeStore` documented as "current Node, **when visible or hidden**", filled from every upsert; only `orderedVisibleChatNodes` filters on `visibility === 'visible'` |
-| Does a `tool.call.toolview` row get a snapshot hook? | Yes — `useChat` is a session-standard hook provided by `dsh-client-ui-chat`, and `dsh-client-ui-tool` declares the child slot `scope: 'session'`; a session slot rendered without its sources **throws** rather than silently losing the hook |
-
-**The node is published `visibility: 'hidden'`** because of the chat's row ordering: rows sort by
-`anchorSeq` (`orderedVisibleChatNodes`), a tool row anchors on its `tool/call` event, and the Host
-appends `tool/call` *before* it asks for approval — so the plugin's `cua/preview` event always has the
-larger seq and any **visible** node built from it sorts *below* the row the user is looking at. A
-visible carrier therefore showed `after the action` above `before the action`. Fabricating a smaller
-`anchorSeq` is not an option: the field is required to come from durable ordering evidence.
-
-So the carrier stays in Client state but out of the visible flow, and the one row that owns the call
-paints both frames in the order they happened: `before the action` / image, then `after the action` /
-image. Ordering *inside* a row is the plugin's to guarantee; ordering *between* rows is not.
-
-### The one trap
-
-`useChat` is `useSyncExternalStoreWithSelector(subscribe, getSnapshot, undefined, sel)` — no custom
-comparator, so selections are compared with `Object.is`. The row therefore returns
-`node.data.attachment`, the object held in the Definition's State; building a fresh object inside the
-selector would re-render forever. The verifier asserts this stability directly, because a reader of
-the code cannot see the comparator.
-
-Because the carrier is hidden, the plugin registers **no `conversation.chat.node` renderer at all** —
-a hidden kind never reaches that seat, so such a renderer would be dead code.
+**Once the call has settled**, the row paints the frames of the action in the order they happened:
+`before the action` / image, then `after the action` / image. A refusal ran nothing: its single frame is
+the approval-time state and is captioned `at approval time (no action ran)`. Roles come from
+`presentationMeta.frames`, never from an image's position and never from `granted` alone — so a grant
+whose post-action capture failed keeps `before the action` on its one frame.
 
 ## What the plugin claims, and what it deliberately leaves alone
 
-The Client half's entire footprint is:
-
-- one registered Definition (the hidden carrier),
-- three keyed `tool.call.toolview` seats — for `browser_act`, `browser_navigate` and
-  `browser_screenshot`, the three tools that carry an image. `browser_snapshot` returns text only, so
-  it needs no row.
-
-It registers into **no `single` slot**, in particular not
+The Client half's entire footprint is three keyed `tool.call.toolview` seats — for `browser_act`,
+`browser_navigate` and `browser_screenshot`, the three tools that carry an image. `browser_snapshot`
+returns text only, so it needs no row. It registers no event definition, injects only `slots`, the one
+service its rows genuinely need, and registers into **no `single` slot**, in particular not
 `conversation.approval.detail` or `tool.call.images`. The rule this encodes: the only safe slots for a
 third-party client plugin are ones it owns (keyed seats) or a `single` slot it has verified is free
 against the *resolved* install — because a collision fails an unrelated shipped package, not the

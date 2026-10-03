@@ -40,6 +40,30 @@ export const inject = ['tools', 'approval', 'sessions']
 
 const EXPECTED = ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_act']
 
+/**
+ * The event types the harness itself writes into a probe session.
+ *
+ * Anything else in the log was written by a plugin — which is the defect this check exists for: a
+ * plugin-owned type is outside the harness vocabulary, and the persistence reader refuses to reopen
+ * a session containing one.
+ */
+const HARNESS_LOG_EVENTS = new Set([
+  // Written when the harness creates and drives the session.
+  'permission/preset',
+  'sandbox/mode',
+  'approval/policy',
+  'turn/start',
+  'turn/end',
+  'step/start',
+  'step/end',
+  // Written by the agent loop around every tool call.
+  'tool/call',
+  'tool/result',
+  // Written by the approval seam.
+  'approval/asked',
+  'approval/decided',
+])
+
 /** One attachment that no Session log could possibly reference. */
 const UNREFERENCED = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 
@@ -120,12 +144,14 @@ async function run(ctx, config, listed, resultPath) {
 
   verdict.ok = listed.length === EXPECTED.length &&
     verdict.actionGranted === true &&
-    verdict.previewEventsInSessionLog === 1 &&
-    verdict.referenceIsInScannedPosition === true &&
-    verdict.previewEventIsLogOnly === true &&
-    verdict.previewEventCallId === 'cua-preview-probe-call' &&
+    verdict.frameCount === 2 &&
+    verdict.framesAreDistinct === true &&
+    verdict.framesAreImageBlocks === true &&
     verdict.blankNavigationOmittedFrame === true &&
-    verdict.credentialReferenced === true &&
+    // The log must stay reopenable: no event type outside the harness vocabulary, and nothing this
+    // plugin wrote.
+    Array.isArray(verdict.unknownEventTypes) && verdict.unknownEventTypes.length === 0 &&
+    verdict.pluginAppendedNoEvent === true &&
     verdict.unreferencedRefused === true &&
     // The approval sentence is the card's whole consent text, so its wording and its language are
     // checked — but against the language the Host actually exposes, never against a value the plugin
@@ -262,10 +288,27 @@ async function authorizeFrames(ctx, declaredLocale) {
   const blankNavigationOmittedFrame = load?.approvalImage === undefined &&
     load?.approvalScreenshotPath === undefined
 
-  const result = await ctx.tools.get('browser_act').execute(
-    { action: 'click', selector: '#go' },
-    { agent, callId: 'cua-preview-probe-call', signal: new AbortController().signal },
-  )
+  // The gated click goes through the REAL pipeline rather than a direct `execute()` call: the
+  // pipeline is what appends `tool/result`, and that known event type is what carries the frames'
+  // references into the log. A direct call would prove nothing about readability — the reference
+  // would exist only in a value the Host never persisted.
+  const callId = 'cua-preview-probe-call'
+  const dispatched = await ctx.tools.execute({
+    callId,
+    name: 'browser_act',
+    arguments: { action: 'click', selector: '#go' },
+    agent,
+    signal: new AbortController().signal,
+  })
+  const dispatchedText = (dispatched?.content ?? [])
+    .filter((block) => block?.type === 'text')
+    .map((block) => block.text)
+    .join('\n')
+  // Presentation order, straight out of the result the Host persisted: the screen the user approved
+  // first, the state after the action second.
+  const frames = (dispatched?.content ?? [])
+    .filter((block) => block?.type === 'image')
+    .map((block) => block.attachment)
 
   // Read the authorization input off the REAL Session log this product just wrote.
   //
@@ -273,38 +316,47 @@ async function authorizeFrames(ctx, declaredLocale) {
   // `sessionController` inside its own isolation scope, so neither `ctx.get('sessionController')`
   // nor the non-strict `ctx.get(..., false)` lookup finds it from a root-level patch row, and
   // Cordis exposes no downward fiber walk. What this probe can prove is the part the plugin owns —
-  // that the real product commits an event carrying the reference in the exact position the
-  // authorizer scans (`dsh-api-session-controller`: `referencedImage` → `imageInEvent` →
-  // `data.content` / `data.message.content` / `data.inserted[].content`), and that nothing else in
-  // this log references it, so the credential stands on the plugin's own event.
-  const previewEvents = []
+  // that the reference sits in the exact position the authorizer scans
+  // (`dsh-api-session-controller`: `referencedImage` → `imageInEvent` → `data.content` /
+  // `data.message.content` / `data.inserted[].content`) — and, more importantly, that the plugin
+  // adds no event of its own to the log at all.
+  const { KNOWN_SESSION_EVENT_TYPES: knownTypes } = await import('@deepseek-ai/dsh-session')
   const allEvents = []
   for (let seq = 0; seq < session.seq; seq += 1) {
     const event = session.eventAt(seq)
-    if (event === undefined) continue
-    allEvents.push(event)
-    if (event.type === 'cua/preview') previewEvents.push(event)
+    if (event !== undefined) allEvents.push(event)
   }
 
-  const credential = result?.approvalImage?.attachmentId
-  const modelFrame = result?.image?.attachmentId
-  const blockMatches = (content, attachmentId) => {
-    if (!Array.isArray(content)) return false
-    for (const value of content) {
-      if (value === null || typeof value !== 'object' || Array.isArray(value)) continue
-      if (value.type === 'image' && value.attachment !== null && typeof value.attachment === 'object' &&
-          String(value.attachment.attachmentId) === attachmentId) return true
-      if (value.type === 'tool-result' && blockMatches(value.content, attachmentId)) return true
-    }
-    return false
-  }
-  const logReferences = (attachmentId) => allEvents.some((event) =>
-    blockMatches(event.data?.content, attachmentId) ||
-    blockMatches(event.data?.message?.content, attachmentId) ||
-    (event.data?.inserted ?? []).some((inserted) => blockMatches(inserted?.content, attachmentId)))
+  // The defect this replaced: a plugin-owned event type is outside the harness vocabulary, and a
+  // live `Session.append()` cannot set the envelope's `ignorable: true` marker, so the persistence
+  // reader refused to reopen any session that contained one. Both halves are asserted here, in the
+  // real product: no unknown type may appear, and every event must be one the harness itself wrote.
+  const unknownEventTypes = allEvents
+    .filter((event) => !knownTypes.has(event.type))
+    .map((event) => `${event.type}@${event.seq}`)
+  const pluginAppendedNoEvent = allEvents.every((event) => HARNESS_LOG_EVENTS.has(event.type))
 
-  const previewEvent = previewEvents[0]
-  const previewContent = previewEvent?.data?.content
+  // What the Host authorizes is an attachment referenced by a content block of a committed event
+  // (`imageInEvent` scans `data.content` / `data.message.content` / `data.inserted[].content`). This
+  // probe cannot append those events: `ctx.tools.execute` validates and materializes the result, but
+  // the agent loop is what logs `tool/call` / `tool/result`, so what is asserted here is the value
+  // shape that loop persists — image blocks, in presentation order, carrying real references.
+  const framesAreImageBlocks = (dispatched?.content ?? [])
+    .filter((block) => block?.type === 'image')
+    .every((block) => block?.attachment !== null && typeof block?.attachment === 'object' &&
+      typeof block.attachment.attachmentId === 'string' && block.attachment.attachmentId !== '' &&
+      typeof block.attachment.mediaType === 'string' && block.attachment.mediaType.startsWith('image/'))
+
+  const approvalDecision = /approval: (\S+)/.exec(dispatchedText)?.[1] ?? null
+
+  // Control: an attachment nothing in this log could reference must be absent, so a scan that
+  // accidentally answers "true" for everything is caught.
+  const referenced = (content, attachmentId) => Array.isArray(content) && content.some((block) =>
+    block?.type === 'image' && String(block.attachment?.attachmentId) === attachmentId)
+  const unreferencedIsReferenced = allEvents.some((event) =>
+    referenced(event.data?.content, UNREFERENCED) ||
+    referenced(event.data?.message?.content, UNREFERENCED) ||
+    (event.data?.inserted ?? []).some((inserted) => referenced(inserted?.content, UNREFERENCED)))
 
   // The approval sentence in the REAL product: what language the Host exposes, what language the
   // sentence actually came out in, and what the profile declared independently of both.
@@ -330,8 +382,8 @@ async function authorizeFrames(ctx, declaredLocale) {
 
   return {
     sessionId: String(sessionId),
-    actionGranted: result?.granted === true,
-    approvalDecision: result?.decision,
+    actionGranted: dispatched?.isError === false && dispatchedText.includes('granted: true'),
+    approvalDecision,
     // Two approvals were answered: the navigation, then the click. The click's sentence is the last.
     navigationReason: granted[0],
     approvalReason,
@@ -363,20 +415,17 @@ async function authorizeFrames(ctx, declaredLocale) {
     approvalReasonLanguageMatchesDeclaredLocale: declaredLanguage === null
       ? null
       : approvalReasonLanguage === declaredLanguage,
-    credentialAttachmentId: credential,
-    modelFrameAttachmentId: modelFrame,
-    previewEventsInSessionLog: previewEvents.length,
-    // The plugin's own event is the ONLY thing that can authorize the credential here, because this
-    // probe calls `execute()` directly and so no `tool/result` event is ever appended.
-    toolResultEventsInSessionLog: allEvents.filter((event) => event.type === 'tool/result').length,
-    credentialReferenced: credential !== undefined && logReferences(credential),
-    referenceIsInScannedPosition: previewContent?.[0]?.type === 'image' &&
-      previewContent[0].attachment?.attachmentId === credential,
-    previewEventIsLogOnly: previewEvent !== undefined && previewEvent.surfaceOp === undefined,
-    // The join key the shipped approval panel's `conversation.approval.detail` region receives.
-    previewEventCallId: previewEvent?.data?.callId,
-    previewEventAction: previewEvent?.data?.action,
+    credentialAttachmentId: frames[0]?.attachmentId,
+    modelFrameAttachmentId: frames[1]?.attachmentId,
+    frameCount: frames.length,
+    framesAreDistinct: frames.length === 2 &&
+      typeof frames[0]?.attachmentId === 'string' && frames[0].attachmentId !== frames[1]?.attachmentId,
+    framesAreImageBlocks,
+    // The invariants that keep the log reopenable, read off the real log this product wrote.
+    unknownEventTypes,
+    pluginAppendedNoEvent,
+    sessionEventTypes: allEvents.map((event) => event.type),
     blankNavigationOmittedFrame,
-    unreferencedRefused: !logReferences(UNREFERENCED),
+    unreferencedRefused: !unreferencedIsReferenced,
   }
 }

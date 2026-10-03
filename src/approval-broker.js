@@ -51,10 +51,23 @@ export class ApprovalUnavailableError extends Error {
 /**
  * Broker that turns one proposed browser action into an approved-and-reviewed action.
  *
- * The screenshot is persisted through `ctx.attachments.saveImage()` — the documented durable
- * image channel (`docs/subsystems/attachment.md`) — additionally written to disk so the evidence is
- * a real, parseable file, and **referenced from the Session log** so the Host will authorize a
- * Client read of it (see the frame-admission step below).
+ * The screenshot is written to disk so the evidence is a real, parseable file, and handed back to
+ * the caller as captured bytes. **This module writes nothing to the Session log.** An earlier
+ * revision referenced the frame from a plugin-owned `cua/preview` event so the Host would authorize
+ * a Client read of it; that event type is outside the harness's known vocabulary and a live
+ * `Session.append()` cannot mark it `ignorable`, so every session that ran a gated action became
+ * unreadable to the persistence reader ("contains event type … unknown to this harness and not
+ * marked ignorable; refusing to interpret the log"). The documented rule for plugin authors is
+ * explicit (`dsh-agent-preset/skills/cordis-plugin-development/references/practices.md`):
+ * "Do not append session events with a new `type` … live `Session.append()` cannot set that marker,
+ * so the Session would refuse to reopen."
+ *
+ * The frame reaches the Client through the call's own `tool/result`, and this plugin invents no
+ * event for it:
+ *
+ * 1. **Once the call returns**, `tools.js` saves the same bytes as an attachment and puts the
+ *    reference in that call's own `tool/result` — a known event type whose image references the Host
+ *    authorizes — so the frames stay readable in the transcript afterwards.
  */
 export class CuaApprovalBroker {
   /** Every decision taken, in order. The acceptance test reads this as machine-checkable evidence. */
@@ -151,39 +164,11 @@ export class CuaApprovalBroker {
       }
     }
 
-    // ---- Persist the screenshot through the documented attachment channel ------------------
-    let attachmentRef = null
-    if (screenshot !== null) {
-      try {
-        attachmentRef = await this.#persistImage(screenshot)
-      } catch (error) {
-        this.#logger?.warn?.(
-          `[dsh-cua-preview] attachment persistence failed; the PNG file is still on disk: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        )
-      }
-    }
-
-    // ---- Reference the frame from the Session log so a Client may read it back -------------
-    // `callId` rides in the event so the Client can correlate this screen with the tool call the
-    // approval names: the shipped approval panel's `conversation.approval.detail` receives the
-    // callId and nothing else, and that is the join key.
-    const facts = {
-      ...(callId === undefined ? {} : { callId }),
-      action,
-      toolName,
-    }
-    const frameAdmitted = attachmentRef === null ? false : this.#admitFrame(agent, attachmentRef, facts)
-
     // ---- Raise the official DSH approval request ------------------------------------------
-    // The reason states WHAT is about to happen and stays on one line. `reason` is the seam's
-    // free-text field for *why the asker is asking* (`docs/subsystems/approval.md`), not a place
-    // for evidence metadata: an earlier revision folded the screenshot path and byte size into it
-    // and every renderer mishandled it — the shipped panel grew a three-line headline carrying a
-    // path the user cannot open (measured: a 129 px card becomes 177 px), and the third-party
-    // desktop bubble on the operator's machine truncates it to three CSS-clamped lines. The
-    // screenshot facts remain in the tool result text and on disk.
+    // The reason states WHAT is about to happen and stays on one line: it is the seam's free-text
+    // field for *why the asker is asking* (`docs/subsystems/approval.md`), and the shipped panel
+    // renders it as the card's headline. The evidence travels by the route the class comment
+    // names, never through this string.
     const reason = description
 
     const request = {
@@ -205,8 +190,6 @@ export class CuaApprovalBroker {
         granted: false,
         reason: `approval.request threw: ${error instanceof Error ? error.message : String(error)}`,
         screenshot,
-        attachmentRef,
-        frameAdmitted,
         frameOmitted: blankScreen ? 'blank-screen' : null,
       }
       this.decisions.push(failure)
@@ -222,8 +205,6 @@ export class CuaApprovalBroker {
       granted: decision === GRANTING_OUTCOME,
       reason,
       screenshot,
-      attachmentRef,
-      frameAdmitted,
       captureError: captureError === null ? null : String(captureError),
       // Why no credential frame exists, when none does: the current screen was an unloaded empty
       // document. Distinct from a capture failure, which is reported as `captureError`.
@@ -233,97 +214,9 @@ export class CuaApprovalBroker {
     return result
   }
 
-  /**
-   * Reference one persisted frame from the Session log, so the Host will serve it to a Client.
-   *
-   * This is not optional bookkeeping — it is the read authorization. `dsh-api-session-controller`'s
-   * `attachment()` proves reachability before returning any bytes:
-   *
-   * ```js
-   * const ref = referencedImage(source.events, String(request.attachmentId))
-   * if (ref === void 0) throw new RemoteError('session/attachment-invalid',
-   *   'Image is not referenced by this session.', { reason: 'ATTACHMENT_NOT_REFERENCED' })
-   * ```
-   *
-   * and `imageInEvent` scans only `data.content`, `data.message.content`, `data.inserted[].content`
-   * and assistant stream chunks. A reference carried solely by `result.meta` is persisted and
-   * replayable but **not readable** — which is exactly how the approved frame reached the card as
-   * "screenshot could not be loaded" while the model-facing frame rendered fine.
-   *
-   * So the reference is also recorded on a plugin-owned **log-only** event.
-   * `docs/subsystems/session.md` states that a plugin may merge extra `SessionEventMap` types and
-   * that these are log-only — not `SurfaceEventType`s, contributing nothing to derived history — so
-   * the model never sees this frame while the authorizer does.
-   *
-   * The same event is the Client's source for the two places the frame is shown *while the user is
-   * deciding*: `docs/subsystems/conversation.md` documents registering a `ConversationNodeDefinition`
-   * over a plugin-owned event plus a keyed `conversation.chat.node` renderer, and the shipped approval
-   * panel declares a `conversation.approval.detail` region whose only owner prop is `callId` — which
-   * is why the call id is recorded here.
-   *
-   * @param {object} agent - the asking agent; its `session` receives the event.
-   * @param {object} ref - the serialized `ImageAttachmentRef` to reference.
-   * @param {object} [facts] - correlation facts recorded beside the reference.
-   * @param {string} [facts.callId] - the correlated tool call, when the asker supplied one.
-   * @param {string} [facts.action] - the gated action (`click` | `fill` | `submit` | `navigate`).
-   * @param {string} [facts.toolName] - the tool raising the request.
-   * @returns {boolean} whether the frame is now readable by a Client.
-   */
-  #admitFrame(agent, ref, facts = {}) {
-    const session = agent?.session
-    if (session === undefined || typeof session.append !== 'function') {
-      this.#logger?.warn?.(
-        '[dsh-cua-preview] cannot reference the approved frame: the agent has no Session log; ' +
-          'the card will not show it',
-      )
-      return false
-    }
-    try {
-      // `content` is the position the Host authorizer scans. The event type is plugin-owned and
-      // log-only, and it carries no surface metadata.
-      session.append('cua/preview', {
-        content: [{ type: 'image', attachment: ref }],
-        ...facts,
-      })
-      return true
-    } catch (error) {
-      // Failing to reference the frame must not fail the approval: the user is still asked, and
-      // the result reports that the credential cannot be displayed instead of the card trying to
-      // load an image the Host will refuse.
-      this.#logger?.warn?.(
-        `[dsh-cua-preview] could not reference the approved frame from the Session log: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      )
-      return false
-    }
-  }
-
-  /**
-   * Persist one captured frame via the documented attachment service, falling back to the file
-   * already written to disk.
-   *
-   * @param {object} screenshot - the object returned by `BrowserController.screenshotToFile`.
-   * @returns {Promise<object|null>} an `ImageAttachmentRef`-shaped value, or null.
-   */
-  async #persistImage(screenshot) {
-    const attachments = this.#ctx.get('attachments')
-    if (attachments === undefined) return null
-    const ref = await attachments.saveImage({
-      data: screenshot.data,
-      mediaType: 'image/png',
-      name: 'cua-preview.png',
-    })
-    // Serialize the ref to a plain value; the tool's output schema must stay lossless JSON.
-    return {
-      attachmentId: ref.attachmentId,
-      mediaType: ref.mediaType,
-      bytes: ref.bytes,
-      width: ref.width,
-      height: ref.height,
-      ...(ref.name === undefined ? {} : { name: ref.name }),
-    }
-  }
+  // A frame reaches the Client through the `tool/result` of its own call (see the class comment):
+  // that result is a known event type, so the Host authorizes the image reference it carries and
+  // the Client can read the bytes. Nothing else in this class touches the Session log.
 }
 
 /**

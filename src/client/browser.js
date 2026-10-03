@@ -1,7 +1,7 @@
 /**
  * Browser bundle for dsh-cua-preview — the Client half.
  *
- * **One rendering contribution plus one data carrier**, both on documented seams:
+ * **One rendering contribution, on a documented seam: the keyed tool row.**
  *
  * 1. **Tool rows** (`tool.call.toolview`, keyed per browser tool). The built-in Web Client only
  *    paints a durable tool image when the tool has registered a view for that slot; its shipped
@@ -13,15 +13,26 @@
  *    `loadImage` loader it receives in its owner props. That is the "own a distinct slot" route the
  *    slot contract names.
  *
- *    **One row paints both frames, in the order they happened.** The approval-time frame ("before
- *    the action") is rendered first and the result frame ("after the action") below it, so the row
- *    reads as a timeline. Ordering inside one row is ours to guarantee; ordering *between* rows is
- *    not. An earlier revision published the approval-time frame as its own visible Chat node, and
- *    that node sorted *below* the tool row, because the chat orders nodes by `anchorSeq`
- *    (`orderedVisibleChatNodes`, `dsh-client-ui-chat`) and the tool row's anchor is the `tool/call`
- *    event — which the Host appends *before* it asks for approval, so the preview event always has
- *    the larger seq. The result was the frame the user was meant to review sitting under the frame
- *    that only exists after they reviewed it.
+ *    **Once the call has settled**, the row paints the frames of the gated action in the order they
+ *    happened: the frame the user was shown when they approved ("before the action") first, the frame
+ *    after the action below it, so the row reads as a timeline. Both are references inside the call's
+ *    own `tool/result` content, which is what makes them readable: the Host authorizes an attachment
+ *    read by scanning the Session log for a known event whose content carries the reference
+ *    (`dsh-api-session-controller`: `referencedImage` → `data.content` / `data.message.content` /
+ *    `data.inserted[].content` / assistant stream chunks), otherwise `ATTACHMENT_NOT_REFERENCED`.
+ *    `presentationMeta.frames` names each image's role, so the captions come from the *roles*
+ *    rather than from position or from `granted` alone.
+ *
+ *    **An earlier revision carried the approval-time frame on a plugin-owned `cua/preview` event.**
+ *    That event type is outside the harness's `KNOWN_SESSION_EVENT_TYPES`, and a live
+ *    `Session.append()` cannot set the envelope's `ignorable: true` marker, so the persistence
+ *    reader refused every session that had run a gated action
+ *    ("contains event type \"cua/preview\" … unknown to this harness and not marked ignorable;
+ *    refusing to interpret the log"). The plugin-author rule is explicit
+ *    (`dsh-agent-preset/skills/cordis-plugin-development/references/practices.md`): "Do not append
+ *    session events with a new `type` … live `Session.append()` cannot set that marker, so the
+ *    Session would refuse to reopen." No definition over a plugin-owned event exists any more, and
+ *    nothing in this bundle depends on one.
  *
  *    **The stage a call is in arrives as an explicit prop from DSH 0.2.0-rc.2 on.** That release
  *    replaced the single frozen `block` with a `phase` discriminant (`'preparing' | 'start' |
@@ -30,25 +41,6 @@
  *    spellings — the package still declares support back to `0.1.5-rc.2`, where the stage had to be
  *    inferred from the result node's `kind` — preferring `phase` whenever the host supplies it, so
  *    a stage this build has never heard of degrades to "still running" instead of throwing.
- *
- * 2. **A hidden data node carrying the approval-time frame** (`ConversationNodeDefinition` over the
- *    plugin-owned `cua/preview` event, kind `cua-preview`, `visibility: 'hidden'`). A tool row
- *    cannot show anything while its call is still running — its content and metadata arrive with
- *    the result — so the frame has to reach the Client by another route, and
- *    `docs/subsystems/conversation.md` documents exactly this one: a plugin-owned event family
- *    matched by a Definition whose `buildViewNode` publishes a target-owned node. The row then
- *    finds its own frame by `callId` through the session-scoped standard hook `useChat`
- *    (`ctx.uiSession.provide({ hooks: ['chat'] })` in `dsh-client-ui-chat`; `ui-tool` declares
- *    `tool.call.toolview` as `scope: 'session'`, `children: { 'tool.call.toolview': { kind: 'keyed',
- *    scope: 'session' } }`, so the kit is strict — a slot rendered without it throws rather than
- *    silently losing the hook).
- *
- *    `visibility: 'hidden'` is what makes the node a *carrier* rather than a second, misplaced
- *    copy: the chat's node store keeps it (`ChatNodeStore.get` is documented as "current Node, when
- *    visible or hidden"; the store is built from every upsert and only the render order filters on
- *    `visibility === 'visible'`), while the visible flow — and with it the turn-process disclosure
- *    member count — ignores it. Nothing is registered into `conversation.chat.node`, because a
- *    hidden node never reaches the seat that would dispatch such a renderer.
  *
  * **The approval panel's detail region is deliberately NOT claimed, and this is a hard
  * constraint rather than a preference.** The region looks ideal (the panel renders it inside the
@@ -75,14 +67,6 @@
  * An earlier revision did claim it and produced exactly that boot failure; the verifier now asserts
  * this slot is left untouched.
  *
- * `meta` alone is NOT enough to load any of these. The Host authorizes an attachment read by
- * scanning the Session log for an event whose content carries that reference
- * (`dsh-api-session-controller`: `referencedImage` → `data.content` / `data.message.content` /
- * `data.inserted[].content` / assistant stream chunks, otherwise `ATTACHMENT_NOT_REFERENCED`), and
- * `meta` is none of those positions — a card built on `meta` alone renders
- * "screenshot could not be loaded". The Host half therefore references the frame from a
- * plugin-owned log-only `cua/preview` event; every view here is backed by that event.
- *
  * Format matches the loader contract the shipped client bundles use
  * (`@deepseek-ai/dsh-client-ui-approval/lib/client.js`): `window.__ModuleLoader__.load({id, factory})`.
  */
@@ -99,26 +83,18 @@ window.__ModuleLoader__.load({
 		/** The locale namespace the shipped tool rows use. */
 		const NS = "conversation";
 
-		/** The plugin-owned event type carrying the approval-time frame. */
-		const PREVIEW_EVENT = "cua/preview";
-
-		/** The Definition kind the hidden carrier node is published under. */
-		const PREVIEW_KIND = "cua-preview";
-
-		/** The view target the carrier node is published to. */
-		const CHAT_TARGET = "chat";
-
 		/**
-		 * The carrier node never reaches the visible flow: the chat's render order filters on
-		 * `visibility === 'visible'` (`orderedVisibleChatNodes`), while `ChatNodeStore.values()`
-		 * keeps every materialized node — the store's own type documents `get(key)` as "current
-		 * Node, when visible or hidden". Hidden is therefore how one live carrier exists in Client
-		 * state without painting a second, misordered copy of the frame.
+		 * The caption for each frame role `presentationMeta.frames` can name. The role — not the
+		 * image's position and not `granted` alone — decides the caption, so a grant whose
+		 * post-action capture failed still labels its single frame "before the action".
 		 */
-		const CARRIER_VISIBILITY = "hidden";
+		const FRAME_CAPTIONS = {
+			before: "before the action",
+			after: "after the action"
+		};
 
-		/** The caption for the approval-time frame; the result frame says "after the action". */
-		const BEFORE_CAPTION = "before the action";
+		/** The caption a refusal's single frame carries: nothing ran, so it IS the approval-time state. */
+		const REFUSAL_CAPTION = "at approval time (no action ran)";
 
 		/** Inline styles: no CSS injection, so there is no stylesheet tag to own or clean up. */
 		const S = {
@@ -300,40 +276,6 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Find the approval-time frame belonging to one tool call.
-		 *
-		 * The carrier Definition below publishes one hidden node per `cua/preview` event; this reads
-		 * the frame back by the call id recorded beside it. The scan is the same shape the shipped
-		 * `ApprovalCommand` uses to find its pending call's command
-		 * (`dsh-client-ui-chat`'s `useChat((snapshot) => …snapshot.nodes.values()…)`), and it is
-		 * bounded by the loaded window's node count.
-		 *
-		 * The returned value is the attachment object held in the Definition's State, so it is
-		 * reference-stable across publishes — which `useChat` requires, because it compares
-		 * selections with `Object.is` (`useSyncExternalStoreWithSelector` without a custom
-		 * comparator). Returning a fresh object here would re-render forever.
-		 *
-		 * @param snapshot - the Chat snapshot handed to the selector.
-		 * @param callId - the tool call this row belongs to.
-		 * @returns the durable reference to display, or null when this call has no frame.
-		 */
-		function previewImageOf(snapshot, callId) {
-			if (snapshot === null || typeof snapshot !== "object") return null;
-			const nodes = snapshot.nodes;
-			if (nodes === null || typeof nodes !== "object" || typeof nodes.values !== "function") return null;
-			for (const candidate of nodes.values()) {
-				if (candidate === null || typeof candidate !== "object") continue;
-				if (candidate.kind !== PREVIEW_KIND) continue;
-				const data = candidate.data;
-				if (data === null || typeof data !== "object") continue;
-				if (callId !== undefined && callId !== null && data.callId !== callId) continue;
-				const image = validImageRef(data.attachment);
-				if (image !== null) return image;
-			}
-			return null;
-		}
-
-		/**
 		 * The lifecycle stage a Tool view is being rendered for.
 		 *
 		 * DSH 0.2.0-rc.2 hands the view an explicit `phase` beside a stage-specific `block`
@@ -375,53 +317,54 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Caption one result frame.
+		 * Caption the image at one position of a gated result.
 		 *
-		 * The result carries at most one image and its caption comes from the persisted
-		 * `presentationMeta`: a grant means the frame is the state after the action; a refusal
-		 * means no action ran, so the frame is the approval-time state. A result with no metadata
-		 * (a read-only screenshot) stays uncaptioned.
+		 * `presentationMeta.frames` names each image's role in presentation order, which is the whole
+		 * reason it is persisted: the card must not infer a role from an image's position, and a
+		 * missing frame must not shift its neighbour's caption. The before-frame says nothing ran
+		 * when the action was refused, because that is what the reader needs to know.
+		 *
+		 * A result without a usable role list falls back to the rule an earlier build obeyed — one
+		 * image per gated result, captioned from `granted` — and only for exactly that shape: one
+		 * label over two different pictures would be a claim this result cannot back.
 		 *
 		 * @param meta - the persisted metadata, or null.
+		 * @param index - the image's position in the result content.
+		 * @param imageCount - how many images this result carries.
 		 * @returns a caption, or null to render without one.
 		 */
-		function resultCaption(meta) {
+		function frameCaption(meta, index, imageCount) {
 			if (meta === null) return null;
-			if (meta.granted === true) return "after the action";
-			if (meta.granted === false) return "at approval time (no action ran)";
+			if (Array.isArray(meta.frames)) {
+				const role = meta.frames[index];
+				if (role === "before") return meta.granted === false ? REFUSAL_CAPTION : FRAME_CAPTIONS.before;
+				// An unknown role renders uncaptioned rather than mislabelled: a log another build
+				// wrote must never gain a claim this one cannot back.
+				return role === "after" ? FRAME_CAPTIONS.after : null;
+			}
+			if (imageCount !== 1) return null;
+			if (meta.granted === true) return FRAME_CAPTIONS.after;
+			if (meta.granted === false) return REFUSAL_CAPTION;
 			return null;
 		}
 
 		/**
 		 * The conversation row for browser_act / browser_navigate / browser_screenshot.
 		 *
-		 * One row paints both frames of one gated action in the order they happened: the
-		 * approval-time frame first (live, from the hidden carrier node, so it is on screen while
-		 * the approval is still pending), then the result frame with its caption. Ordering between
-		 * separate rows is not ours to control — the chat sorts nodes by `anchorSeq`, and the tool
-		 * row's anchor is the `tool/call` event, which precedes the approval event — so the row is
-		 * the only place where "before above, after below" can be guaranteed. See the file header.
+		 * Once the call has settled, the row paints the frames of that gated action in the order they
+		 * happened: the frame the user was shown when they approved first, then the frame after the
+		 * action, each under the caption `presentationMeta.frames` assigns it, both read through
+		 * `loadImage` because both are references in this call's own result content. See the file
+		 * header.
 		 *
-		 * A refusal has no post-action state, so the result's single frame *is* the approval-time
-		 * one. Painting both would show the same picture twice; the frame is therefore dropped from
-		 * the approval block and kept once, under its honest caption.
+		 * A refusal has no post-action state, so its single frame *is* the approval-time one and its
+		 * caption says so.
 		 *
 		 * @param props.phase - the lifecycle stage, when the host declares one (DSH >= 0.2.0-rc.2).
 		 * @param props.block - the frozen stage block: running call or settled result node.
-		 * @param props.callId - the tool call identity, matched against the carrier node.
 		 * @param props.loadImage - session-authorized image loader.
-		 * @param props.useChat - session-scoped selector hook over the Chat target.
 		 */
-		function CuaRow({ phase, block, callId, loadImage, useChat }) {
-			// `tool.call.toolview` is declared `scope: 'session'`, and session-scoped entries get the
-			// session standard kit strictly — a slot rendered without its sources throws at assembly
-			// rather than quietly losing them — so this hook is present whenever the row renders.
-			const selector = react.useMemo(
-				() => (snapshot) => previewImageOf(snapshot, callId),
-				[callId]
-			);
-			const approvalImage = useChat(selector);
-
+		function CuaRow({ phase, block, loadImage }) {
 			// A detached reader can hand back a null block for a log another build wrote. `in`
 			// on null throws, so this is checked before anything else touches the value.
 			if (block === null || typeof block !== "object") {
@@ -440,9 +383,6 @@ window.__ModuleLoader__.load({
 			const texts = settled && Array.isArray(block.content) ? collectTexts(block.content) : [];
 			const images = settled && block.isError !== true ? collectImages(block.content) : [];
 			const meta = settled && block.isError !== true ? readMeta(block) : null;
-			const caption = resultCaption(meta);
-			const frameIsTheResultItself = approvalImage !== null &&
-				images.some((image) => image.attachmentId === approvalImage.attachmentId);
 
 			// A preparing call has no arguments yet, so there is nothing honest to summarise: the name
 			// alone is painted instead of the "running…" placeholder, which would read as though the
@@ -464,24 +404,16 @@ window.__ModuleLoader__.load({
 				)
 			];
 
-			if (loadImage !== undefined && loadImage !== null) {
-				// The approval-time frame first: this is the picture the user reviewed, and it stays
-				// as the top of the row's timeline once the result frame arrives below it.
-				if (approvalImage !== null && !frameIsTheResultItself) {
-					children.push(jsx("div", { style: S.caption, children: BEFORE_CAPTION }, "before-caption"));
-					children.push(jsx(CuaImage, { image: approvalImage, loadImage }, "before-image"));
-				}
-			}
-
 			for (let i = 0; i < texts.length; i += 1) {
 				children.push(jsx("div", { style: S.text, children: texts[i] }, `text-${i}`));
 			}
 
 			if (loadImage !== undefined && loadImage !== null) {
-				if (images.length > 0 && caption !== null) {
-					children.push(jsx("div", { style: S.caption, children: caption }, "caption"));
-				}
 				for (let i = 0; i < images.length; i += 1) {
+					const caption = frameCaption(meta, i, images.length);
+					if (caption !== null) {
+						children.push(jsx("div", { style: S.caption, children: caption }, `caption-${i}`));
+					}
 					children.push(jsx(CuaImage, { image: images[i], loadImage }, `image-${i}`));
 				}
 			}
@@ -489,97 +421,23 @@ window.__ModuleLoader__.load({
 			return jsx("div", { style: S.card, children });
 		}
 
-		/**
-		 * Read the approval-time frame out of one `cua/preview` event.
-		 *
-		 * The shape is the one the Host half appends: the reference sits in `content`, which is the
-		 * position the Host's own attachment authorizer scans, and the correlation facts sit beside
-		 * it. Anything malformed yields null, so a log written by another build renders nothing
-		 * rather than crashing the transcript.
-		 *
-		 * @param event - a durable Session event.
-		 * @returns `{attachment, callId, action, toolName}`, or null.
-		 */
-		function previewDataOf(event) {
-			if (event === null || typeof event !== "object") return null;
-			const data = event.data;
-			if (data === null || typeof data !== "object") return null;
-			const blocks = Array.isArray(data.content) ? data.content : [];
-			let attachment = null;
-			for (const part of blocks) {
-				if (part !== null && typeof part === "object" && part.type === "image") {
-					attachment = validImageRef(part.attachment);
-					if (attachment !== null) break;
-				}
-			}
-			if (attachment === null) return null;
-			return {
-				attachment,
-				callId: typeof data.callId === "string" && data.callId !== "" ? data.callId : null,
-				action: typeof data.action === "string" ? data.action : null,
-				toolName: typeof data.toolName === "string" ? data.toolName : null
-			};
-		}
-
-		/**
-		 * The Conversation Definition for the plugin-owned `cua/preview` family.
-		 *
-		 * One event is one whole checkpoint, so it is its own start Match and there is nothing to
-		 * fold: `update` only ever has to reject non-checkpoint events, which `match` never admits.
-		 * The identity is the correlated tool call when there is one, which is how the row finds its
-		 * own frame; the event's own `seq` is the fallback identity.
-		 *
-		 * The node it publishes is a **hidden carrier** — Client state the row reads, not a row of
-		 * its own. See the file header for why the frame cannot be its own visible node.
-		 */
-		const PREVIEW_DEFINITION = {
-			kind: PREVIEW_KIND,
-			target: CHAT_TARGET,
-			match: (event) => {
-				if (event === null || typeof event !== "object" || event.type !== PREVIEW_EVENT) return null;
-				const data = previewDataOf(event);
-				if (data === null) return null;
-				return { id: data.callId ?? String(event.seq), role: "start" };
-			},
-			start: (_context, match) => previewDataOf(match.event) ?? {
-				attachment: null,
-				callId: null,
-				action: null,
-				toolName: null
-			},
-			update: (context) => context.state,
-			buildViewNode: (context) => {
-				const state = context.state;
-				if (state === undefined || state === null || validImageRef(state.attachment) === null) return null;
-				return {
-					key: context.key,
-					kind: PREVIEW_KIND,
-					id: context.id,
-					target: CHAT_TARGET,
-					anchorSeq: context.start?.event.seq ?? context.matches[0]?.event.seq ?? 0,
-					location: context.start?.location ?? context.matches[0]?.location ?? { kind: "unresolved" },
-					visibility: CARRIER_VISIBILITY,
-					data: state
-				};
-			}
-		};
-
 		/** Tool names this view owns. An unclaimed key falls back to the generic row. */
 		const TOOL_KEYS = ["browser_act", "browser_navigate", "browser_screenshot"];
 
-		/** The slot registry plus the Conversation assembly this plugin contributes a node to. */
-		const inject = ["slots", "uiConversation"];
+		/** The slot registry this plugin contributes rows to. */
+		const inject = ["slots"];
 
 		/**
-		 * Claim one keyed Tool-call view per browser tool, and register the carrier Definition the
-		 * rows read their approval-time frame from.
+		 * Claim one keyed Tool-call view per browser tool.
 		 *
-		 * No renderer is registered into `conversation.chat.node`: the carrier is hidden, and the
-		 * chat's render order only contains visible nodes, so a renderer for this kind would be dead
-		 * code. `conversation.approval.detail` is deliberately absent too — the shipped
-		 * `dsh-client-ui-chat` owns that `single` slot at priority 0, and a second same-priority
-		 * registration throws inside ui-chat's apply and takes the whole client plugin load down
-		 * with it. See the file header.
+		 * The frames of a *settled* call arrive inside the call's own result, so the row needs no event
+		 * definition, no carrier node and no session hook for those; it renders them from its owner
+		 * props.
+		 *
+		 * `conversation.approval.detail` is deliberately absent — the shipped `dsh-client-ui-chat`
+		 * owns that `single` slot at priority 0, and a second same-priority registration throws
+		 * inside ui-chat's apply and takes the whole client plugin load down with it. See the file
+		 * header.
 		 *
 		 * @param ctx - the Client plugin context.
 		 */
@@ -589,15 +447,13 @@ window.__ModuleLoader__.load({
 					ctx.slots.register({ name: "tool.call.toolview", key, locale: NS }, CuaRow)
 				);
 			}
-
-			ctx.uiConversation.events.register(PREVIEW_DEFINITION);
 		}
 
 		exports.apply = apply;
 		exports.inject = inject;
 		exports.TOOL_KEYS = TOOL_KEYS;
-		exports.PREVIEW_KIND = PREVIEW_KIND;
-		exports.PREVIEW_EVENT = PREVIEW_EVENT;
+		exports.FRAME_CAPTIONS = FRAME_CAPTIONS;
+		exports.REFUSAL_CAPTION = REFUSAL_CAPTION;
 		return module.exports;
 	}
 });

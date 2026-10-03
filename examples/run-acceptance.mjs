@@ -24,6 +24,10 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { Loader } from '@deepseek-ai/cordis-plugin-loader'
+import { KNOWN_SESSION_EVENT_TYPES as KNOWN_SET } from '@deepseek-ai/dsh-session'
+
+/** The event types the harness itself writes into this session: turn enclosure plus the audit pair. */
+const HARNESS_LOG_EVENTS = new Set(['turn/start', 'approval/asked', 'approval/decided'])
 
 const PLUGIN_PATH = resolve(import.meta.dirname, '../src/index.js')
 const TOOL_NAMES = ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_act']
@@ -191,10 +195,9 @@ check('the approval carries the correlated tool call id',
   `callId=${askedEvents[0]?.data?.callId}`)
 
 // `reason` is the seam's one-line explanation of WHY the asker is asking
-// (`docs/subsystems/approval.md`), not a carrier for evidence metadata. An earlier revision folded
-// the screenshot path and byte size into it, which every renderer mishandled: the shipped panel
-// grew a three-line headline carrying a path the user cannot open, and the third-party desktop
-// bubble used by the operator truncated it to three CSS-clamped lines.
+// (`docs/subsystems/approval.md`), and the shipped panel renders it as the card's headline. The
+// screenshot is not carried here: it has its own routes — the pending-frame route while the ask is
+// open, and the call's own result afterwards.
 {
   const reason = askedEvents[0]?.data?.reason
   check('the approval reason is a single line',
@@ -285,17 +288,24 @@ check('the approval frame is named as the approval frame',
     `${approvalPng.byteLength} vs ${resultPng.byteLength}`)
 }
 
-// ---- The approved frame is a CARD fact, not model content -------------------------------------
+// ---- The approved frame travels inside the call's own result ----------------------------------
 //
-// Discussion with the plugin's operator settled the design tension: the frame the user APPROVED is
-// the audit credential and must stay visible in the conversation, but handing the model a
-// pre-action frame is what made a real conversation report "the click failed". `presentationMeta`
-// is the documented channel for exactly this split — `docs/cookbook/adding-a-tool.md`: "UI-only
-// formatting stays out of the model result", and the core persists the projection on `tool/result`
-// as `result.meta`, which the Client toolview reads back from `ToolResultNode.meta`.
+// The frame the user APPROVED is the audit credential and must stay visible in the conversation.
+// It travels as an image block inside the call's own `tool/result` content, which is the one
+// position the Host's attachment authorizer scans (`dsh-api-session-controller`'s `imageInEvent`
+// reads `data.content`, `data.message.content`, `data.inserted[].content` and assistant stream
+// chunks; a reference anywhere else answers `ATTACHMENT_NOT_REFERENCED`). The card learns which
+// frame is which from `presentationMeta.frames`, which the core persists on `tool/result` as
+// `result.meta` (`docs/cookbook/adding-a-tool.md`: "Project durable card data with
+// `presentationMeta`").
 //
-// So: model-facing content carries ONE image (the post-action frame), and the credential rides in
-// the card projection with its own durable attachment reference.
+// An earlier revision referenced the frame from a plugin-owned `cua/preview` event instead. That
+// event type is outside the harness's vocabulary, and a live `Session.append()` cannot set the
+// envelope's `ignorable: true` marker, so the persistence reader refused every session that had run
+// a gated action: "contains event type "cua/preview" (seq 9403) unknown to this harness and not
+// marked ignorable; refusing to interpret the log". This plugin now appends NOTHING, and the checks
+// below hold that line from both ends: no event type outside the harness vocabulary may appear in
+// the log, and the frames must be referenced from the content block the authorizer scans.
 
 console.log('\n--- approval credential channel ---\n')
 
@@ -304,78 +314,45 @@ console.log('\n--- approval credential channel ---\n')
   const content = tool.output.render(args, clickResult)
   const imageBlocks = content.filter((block) => block.type === 'image')
 
-  check('the model-facing content carries exactly one image',
-    imageBlocks.length === 1, `images=${imageBlocks.length}`)
-  check('that model-facing image is the post-action attachment',
-    imageBlocks[0]?.attachment?.attachmentId === clickResult.image.attachmentId,
+  check('the model-facing content carries both frames of the action',
+    imageBlocks.length === 2, `images=${imageBlocks.length}`)
+  check('the first frame is the screen the user approved',
+    imageBlocks[0]?.attachment?.attachmentId === clickResult.approvalImage?.attachmentId,
     `${imageBlocks[0]?.attachment?.attachmentId}`)
+  check('the second frame is the post-action state',
+    imageBlocks[1]?.attachment?.attachmentId === clickResult.image.attachmentId,
+    `${imageBlocks[1]?.attachment?.attachmentId}`)
+  check('the two frames are different attachments (the page changed between them)',
+    imageBlocks[0]?.attachment?.attachmentId !== imageBlocks[1]?.attachment?.attachmentId)
 
   const meta = tool.output.presentationMeta(args, clickResult)
+  check('the card projection names each frame role in presentation order',
+    JSON.stringify(meta?.frames) === JSON.stringify(['before', 'after']), JSON.stringify(meta?.frames))
   check('the card projection reports the grant',
     meta?.granted === true && meta?.decision === 'allowed-once', JSON.stringify(meta))
-  check('the card projection carries the approved frame as a durable reference',
-    typeof meta?.approvedFrame?.attachmentId === 'string' && meta.approvedFrame.attachmentId.length > 0,
-    `approvedFrame=${meta?.approvedFrame?.attachmentId}`)
-  check('the approved frame is a DIFFERENT attachment from the model-facing frame',
-    meta.approvedFrame.attachmentId !== clickResult.image.attachmentId,
-    `${meta.approvedFrame.attachmentId} vs ${clickResult.image.attachmentId}`)
   check('the card projection keeps the approved frame file for audit',
     meta?.approvedPath === clickResult.approvalScreenshotPath, String(meta?.approvedPath))
-  check('the approved frame is NOT in the model-facing content',
-    imageBlocks.every((block) => block.attachment.attachmentId !== meta.approvedFrame.attachmentId))
   check('the card projection survives a JSON round trip losslessly',
     JSON.stringify(JSON.parse(JSON.stringify(meta))) === JSON.stringify(meta))
+  check('the approved frame is referenced from a content block, not from meta alone',
+    imageBlocks.some((block) => block.attachment?.attachmentId === clickResult.approvalImage?.attachmentId),
+    'the Host authorizer scans data.content, never result.meta')
 
-  // ---- Readability is a separate property from being described -------------------------------
-  //
-  // This is the check that was missing, and its absence shipped a defect: the card was told about
-  // the credential by `result.meta`, so it rendered a caption and then asked the Host for bytes the
-  // Host refused — "screenshot could not be loaded".
-  //
-  // The Host authorizes an attachment read by scanning the Session log for an event whose content
-  // carries that exact reference (`dsh-api-session-controller`: `attachment()` calls
-  // `referencedImage(source.events, attachmentId)`, whose `imageInEvent` scans `data.content`,
-  // `data.message.content` and `data.inserted[].content`, and otherwise answers
-  // `ATTACHMENT_NOT_REFERENCED`). `meta` is none of those positions.
-
-  const previewEvents = eventsOfType(session, 'cua/preview')
-  check('the plugin references the approved frame from its own log-only event',
-    previewEvents.length === 1, `cua/preview events=${previewEvents.length}`)
-  check('that event carries the reference in the position the Host authorizer scans',
-    previewEvents[0]?.data?.content?.[0]?.type === 'image' &&
-      previewEvents[0].data.content[0].attachment?.attachmentId === meta.approvedFrame.attachmentId,
-    JSON.stringify(previewEvents[0]?.data?.content?.[0]?.attachment))
-  check('that event is log-only (no surface metadata, so the model never sees the frame)',
-    previewEvents[0] !== undefined && previewEvents[0].surfaceOp === undefined,
-    `surfaceOp=${String(previewEvents[0]?.surfaceOp)}`)
-  // The shipped approval panel's `conversation.approval.detail` region receives `callId` and
-  // nothing else, so the event has to carry that join key for the panel to find its frame.
-  check('that event carries the tool call id the approval names',
-    previewEvents[0]?.data?.callId === execBase.callId,
-    `callId=${previewEvents[0]?.data?.callId} expected=${execBase.callId}`)
-  check('that event carries the gated action and tool name',
-    previewEvents[0]?.data?.action === 'click' && previewEvents[0]?.data?.toolName === 'browser_act',
-    `action=${previewEvents[0]?.data?.action} toolName=${previewEvents[0]?.data?.toolName}`)
-  check('a real screen produces a credential frame (the blank-screen suppression did not fire)',
-    cuaPreview.broker.decisions.at(-1)?.frameOmitted === null &&
-      cuaPreview.broker.decisions.at(-1)?.frameAdmitted === true,
-    JSON.stringify({
-      frameOmitted: cuaPreview.broker.decisions.at(-1)?.frameOmitted,
-      frameAdmitted: cuaPreview.broker.decisions.at(-1)?.frameAdmitted,
-    }))
-  check('the Host read rule authorizes the approved frame',
-    sessionReferencesImage(session, meta.approvedFrame.attachmentId),
-    meta.approvedFrame.attachmentId)
-  // This harness calls `execute()` directly, so the tool pipeline never appends a `tool/result`
-  // event here. That makes this the exact worst case the defect lived in — the credential has to be
-  // readable on the strength of the plugin's own event alone, with model-facing content that was
-  // never logged. The model-facing frame's readability is checked against the real Host controller
-  // in `examples/run-real-dsh-load.mjs`, where the pipeline does append that event.
-  check('no tool/result event exists here, so the credential stands on its own event',
-    eventsOfType(session, 'tool/result').length === 0,
-    `tool/result events=${eventsOfType(session, 'tool/result').length}`)
+  // ---- The defect this design replaced, and the checks that keep it out ----------------------
+  check('the plugin appends no event type outside the harness vocabulary',
+    unknownEventTypes(session).length === 0,
+    unknownEventTypes(session).join(', ') || 'every event in the log is one the harness writes')
+  check('the plugin appends nothing to the Session log at all',
+    sessionEventTypes(session).every((type) => HARNESS_LOG_EVENTS.has(type)),
+    sessionEventTypes(session).join(', '))
+  check('no plugin-written event references the frames (the pipeline result is their only carrier)',
+    !sessionReferencesImage(session, clickResult.approvalImage.attachmentId) &&
+      !sessionReferencesImage(session, clickResult.image.attachmentId))
   check('the Host read rule does NOT authorize an unreferenced attachment (control)',
     !sessionReferencesImage(session, 'sha256:definitely-not-in-this-session'))
+  check('a real screen produces a credential frame (the blank-screen suppression did not fire)',
+    cuaPreview.broker.decisions.at(-1)?.frameOmitted === null,
+    JSON.stringify({ frameOmitted: cuaPreview.broker.decisions.at(-1)?.frameOmitted }))
 }
 
 // ---- `browser_navigate` must return the page it actually loaded -------------------------------
@@ -409,8 +386,6 @@ try {
 
   const navTool = ctx.tools.get('browser_navigate')
   const navArgs = { url: navUrl }
-  const previewsBefore = eventsOfType(session, 'cua/preview').length
-
   auditSeen()
   const navResult = await navTool.execute(
     navArgs,
@@ -428,9 +403,9 @@ try {
 
   const navContent = navTool.output.render(navArgs, navResult)
   const navImages = navContent.filter((block) => block.type === 'image')
-  check('navigate model-facing content carries exactly one image',
+  check('a blank-screen navigation returns one image: only the post-navigation frame exists',
     navImages.length === 1, `images=${navImages.length}`)
-  check('the navigate image is the post-navigation attachment',
+  check('that image is the post-navigation attachment',
     navImages[0]?.attachment?.attachmentId === navResult.image.attachmentId,
     `${navImages[0]?.attachment?.attachmentId}`)
 
@@ -443,11 +418,13 @@ try {
   check('a blank screen reports no approval-time screenshot path',
     navResult.approvalScreenshotPath === undefined, String(navResult.approvalScreenshotPath))
   check('a blank screen hands the card no credential reference',
-    navResult.approvalImage === undefined && navMeta?.approvedFrame === undefined,
-    `approvalImage=${String(navResult.approvalImage)} approvedFrame=${String(navMeta?.approvedFrame)}`)
-  check('a blank screen appends no cua/preview event',
-    eventsOfType(session, 'cua/preview').length === previewsBefore,
-    `before=${previewsBefore} after=${eventsOfType(session, 'cua/preview').length}`)
+    navResult.approvalImage === undefined,
+    `approvalImage=${String(navResult.approvalImage)}`)
+  check('a blank screen names one frame role: the post-navigation one',
+    JSON.stringify(navMeta?.frames) === JSON.stringify(['after']), JSON.stringify(navMeta?.frames))
+  check('a blank screen still writes nothing to the Session log',
+    unknownEventTypes(session).length === 0,
+    unknownEventTypes(session).join(', ') || sessionEventTypes(session).join(', '))
   check('the broker records that it omitted the frame because the screen was blank',
     cuaPreview.broker.decisions.at(-1)?.frameOmitted === 'blank-screen',
     `frameOmitted=${String(cuaPreview.broker.decisions.at(-1)?.frameOmitted)}`)
@@ -470,9 +447,18 @@ try {
   check('a loaded screen hands the card the credential reference',
     secondNav.approvalImage !== undefined && secondNav.approvalImage.attachmentId.length > 0,
     String(secondNav.approvalImage?.attachmentId))
-  check('a loaded screen appends exactly one more cua/preview event',
-    eventsOfType(session, 'cua/preview').length === previewsBefore + 1,
-    `count=${eventsOfType(session, 'cua/preview').length}`)
+  check('a loaded screen returns both frames, the approved one first',
+    (() => {
+      const blocks = navTool.output.render(navArgs, secondNav).filter((block) => block.type === 'image')
+      return blocks.length === 2 &&
+        blocks[0].attachment.attachmentId === secondNav.approvalImage.attachmentId &&
+        blocks[1].attachment.attachmentId === secondNav.image.attachmentId
+    })(),
+    'the row paints them in that order')
+  check('a loaded screen names both frame roles',
+    JSON.stringify(navTool.output.presentationMeta(navArgs, secondNav)?.frames) ===
+      JSON.stringify(['before', 'after']),
+    JSON.stringify(navTool.output.presentationMeta(navArgs, secondNav)?.frames))
   check('the blank-screen suppression did not fire for the loaded screen',
     cuaPreview.broker.decisions.at(-1)?.frameOmitted === null,
     `frameOmitted=${String(cuaPreview.broker.decisions.at(-1)?.frameOmitted)}`)
@@ -577,8 +563,8 @@ check('a rejected approval performs no action',
 
   check('a refusal reports granted:false in the card projection',
     refusedMeta?.granted === false, JSON.stringify(refusedMeta))
-  check('a refusal carries no separate approved frame',
-    refusedMeta?.approvedFrame === undefined,
+  check('a refusal names its single frame as the approval-time one',
+    JSON.stringify(refusedMeta?.frames) === JSON.stringify(['before']),
     'the single frame already IS the approval-time state')
   check('a refusal still hands the model the approval-time frame',
     refusedImages.length === 1 &&
@@ -886,6 +872,39 @@ function eventsOfType(session, type) {
   for (let seq = 0; seq < session.seq; seq += 1) {
     const event = session.eventAt(seq)
     if (event?.type === type) out.push(event)
+  }
+  return out
+}
+
+/**
+ * Every event type in the Session log, in seq order.
+ *
+ * @param session - the live Session.
+ * @returns the event types, one per committed event.
+ */
+function sessionEventTypes(session) {
+  const out = []
+  for (let seq = 0; seq < session.seq; seq += 1) out.push(session.eventAt(seq)?.type)
+  return out
+}
+
+/**
+ * Every event type in the log that this harness's own vocabulary does not contain.
+ *
+ * This is the check that makes the log-corruption defect unable to hide. A plugin-owned event type
+ * is outside `KNOWN_SESSION_EVENT_TYPES`, and the persistence reader refuses to interpret a stored
+ * log containing one unless the envelope carries `ignorable: true` — which a live
+ * `Session.append()` cannot set. So a non-empty answer here is exactly the state that made a real
+ * conversation unopenable, and it is detected here rather than after a restart.
+ *
+ * @param session - the live Session.
+ * @returns the offending `type@seq` strings, or an empty array.
+ */
+function unknownEventTypes(session) {
+  const out = []
+  for (let seq = 0; seq < session.seq; seq += 1) {
+    const event = session.eventAt(seq)
+    if (event !== undefined && !KNOWN_SET.has(event.type)) out.push(`${event.type}@${seq}`)
   }
   return out
 }

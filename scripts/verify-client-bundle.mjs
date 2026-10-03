@@ -8,17 +8,19 @@
  *
  * What it proves:
  *   - the bundle parses and its factory runs without throwing
- *   - it exports `apply` and `inject` in the shape the client module system expects
- *   - `apply` claims the three browser tool keys and registers the `cua-preview` Conversation
- *     Definition **as a hidden carrier**, and claims no renderer seat at all
- *   - one Tool row paints BOTH frames in the order they happened — the approval-time frame first,
- *     read live out of the carrier through the session-scoped `useChat` hook, then the result frame
- *     — because ordering between separate rows is the chat's (anchorSeq), not ours
- *   - the frame lookup is exact (call id), reference-stable (what `useSyncExternalStoreWithSelector`
- *     requires), and never duplicates one picture twice on a refusal
+ *   - it exports `apply` and `inject` in the shape the client module system expects, and needs only
+ *     the slot registry — no Conversation service, no event definition, no session hook
+ *   - `apply` claims exactly the three browser tool keys and claims no renderer seat besides them
+ *   - one Tool row paints the frames of one gated action in the order they happened, captioned from
+ *     `presentationMeta.frames` (role, not position), so a grant reads "before the action" /
+ *     "after the action" and a refusal reads "at approval time (no action ran)"
+ *   - nothing in this package writes a Session event: a plugin-owned event type cannot carry the
+ *     envelope's `ignorable` marker, and the persistence reader refuses a session that contains one
+ *     ("contains event type … unknown to this harness and not marked ignorable"). The static guard
+ *     below fails on the first `.append(` that reappears in `src/`.
  *   - it registers into no shipped single-occupancy slot (the collision that broke a client boot)
  *   - malformed or foreign data (bad JSON args, a null call, a corrupt attachment, an unknown
- *     tool name, a malformed plugin event) degrades instead of throwing — display must never crash
+ *     tool name, malformed result metadata) degrades instead of throwing — display must never crash
  *     a replay
  *
  * Usage:  node scripts/verify-client-bundle.mjs
@@ -26,6 +28,7 @@
  */
 
 import { strict as assert } from 'node:assert'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -89,8 +92,8 @@ try {
 check('the factory runs without throwing', true)
 check('it exports apply()', typeof exportsValue.apply === 'function')
 check('it exports an inject service list', Array.isArray(exportsValue.inject), JSON.stringify(exportsValue.inject))
-check('it injects the Conversation assembly as well as the slot registry',
-  exportsValue.inject.includes('slots') && exportsValue.inject.includes('uiConversation'),
+check('it injects the slot registry, and nothing else',
+  JSON.stringify(exportsValue.inject) === JSON.stringify(['slots']),
   JSON.stringify(exportsValue.inject))
 
 // ---------------------------------------------------------------------------------------------
@@ -98,22 +101,15 @@ check('it injects the Conversation assembly as well as the slot registry',
 // ---------------------------------------------------------------------------------------------
 
 const registered = []
-const definitions = []
 
+// Deliberately no `uiConversation`: a bundle that reached for one would throw here, which is the
+// point. This plugin renders from its own slot props and publishes no Conversation node.
 const ctxStub = {
   slots: {
     inject: (_name, callback) => callback(),
     register: (config, component) => {
       registered.push({ config, component })
       return () => {}
-    },
-  },
-  uiConversation: {
-    events: {
-      register: (definition) => {
-        definitions.push(definition)
-        return () => {}
-      },
     },
   },
 }
@@ -140,8 +136,32 @@ check(
 check('it registers no Chat node renderer at all',
   chatNodeEntry === undefined,
   `key=${chatNodeEntry?.config.key}`)
-check('it registers one Conversation Definition',
-  definitions.length === 1, `count=${definitions.length}`)
+// The static half of the same guard: the bundle must never depend on the Conversation event
+// service, and no file in this package may append a Session event.
+const SOURCE_FILES = [
+  'src/index.js',
+  'src/tools.js',
+  'src/browser.js',
+  'src/approval-broker.js',
+  'src/action-text.js',
+  'src/client/browser.js',
+]
+const sources = Object.fromEntries(SOURCE_FILES.map((file) => [
+  file,
+  readFileSync(resolve(import.meta.dirname, '..', file), 'utf8'),
+]))
+/** Strip comments: a comment that names an API is documentation, not a call to it. */
+const stripComments = (source) => source
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/(^|[^:])\/\/.*$/gm, '$1')
+const codeOf = Object.fromEntries(Object.entries(sources).map(([file, text]) => [file, stripComments(text)]))
+
+check('the bundle never consults the Conversation event service',
+  Object.values(codeOf).every((code) => !code.includes('uiConversation') && !code.includes('events.register')),
+  'no uiConversation / events.register outside comments')
+check('nothing in this package appends a Session event',
+  Object.values(codeOf).every((code) => !code.includes('.append(')),
+  'a plugin-owned event type cannot be marked ignorable, so the log would refuse to reopen')
 
 // --- the slot-collision guard -----------------------------------------------------------------
 //
@@ -229,13 +249,23 @@ function realSlotsFace(core) {
   }
 }
 
+/**
+ * The Client context `apply` needs, with the REAL slot registry underneath it.
+ *
+ * @param core - the real `SlotCore` under test.
+ * @returns a context good enough for `apply`.
+ */
+const realCtx = (core) => ({
+  slots: realSlotsFace(core),
+})
+
 {
   // Order A — the shipped occupant is already there, this bundle applies second.
   const core = buildShippedRegistry()
   core.register({ name: 'conversation.approval.detail', registrant: 'dsh-client-ui-chat' }, approvalCommandOccupant)
   let threw = null
   try {
-    exportsValue.apply({ slots: realSlotsFace(core), uiConversation: ctxStub.uiConversation })
+    exportsValue.apply(realCtx(core))
   } catch (error) {
     threw = error
   }
@@ -266,7 +296,7 @@ function realSlotsFace(core) {
   // Order B — this bundle applies FIRST and the shipped occupant registers second. This is the order
   // that produced the operator-visible failure, so the shipped registration must still succeed.
   const core = buildShippedRegistry()
-  exportsValue.apply({ slots: realSlotsFace(core), uiConversation: ctxStub.uiConversation })
+  exportsValue.apply(realCtx(core))
   let threw = null
   try {
     core.register({ name: 'conversation.approval.detail', registrant: 'dsh-client-ui-chat' }, approvalCommandOccupant)
@@ -318,45 +348,19 @@ function collect(node, type, out = []) {
 }
 
 /**
- * A `useChat` stub over a fixed set of Chat nodes.
+ * Render one block through the row.
  *
- * The real hook is `useSyncExternalStoreWithSelector` over the Chat target, with the selector
- * applied to a snapshot shaped `{ nodes: ChatNodeStore }`; this stands in for the snapshot only, so
- * the selector the bundle passes is exercised for real.
+ * The row takes nothing but its owner props: the block the host hands it, the session-authorized
+ * image loader, and the stage prop. There is no hook, no carrier node and no selector to stub.
  *
- * @param nodes - the Chat nodes the snapshot holds (visible and hidden alike).
- * @returns a function with the `useChat(selector)` signature.
+ * @param block - the stage block: running call or settled result node.
+ * @param loadImage - the loader for durable image references.
+ * @returns the expanded render tree.
  */
-function chatWith(nodes) {
-  return (selector) => selector({ nodes: { values: () => nodes } })
-}
-
-/** The stub used when a check wants a row with no carrier node at all. */
-const emptyChat = chatWith([])
-
-/**
- * A `useChat` stub that also records the selector, so the checks can prove the selection is
- * reference-stable — `useSyncExternalStoreWithSelector` compares with `Object.is` and would loop
- * forever on a freshly built object.
- *
- * @param nodes - the Chat nodes the snapshot holds.
- * @returns `{ useChat, selection }` where `selection` reads the captured selector.
- */
-function capturingChat(nodes) {
-  let selector = null
-  return {
-    useChat: (candidate) => {
-      selector = candidate
-      return candidate({ nodes: { values: () => nodes } })
-    },
-    selection: () => selector,
-  }
-}
-
 /** Render one block through the row and return the expanded tree. */
 function render(block, loadImage, options = {}) {
-  const { callId = 'call-1', useChat = emptyChat } = options
-  return expand(Row({ block, callId, loadImage, useChat }))
+  const { callId = 'call-1' } = options
+  return expand(Row({ block, callId, loadImage }))
 }
 
 const attachment = {
@@ -458,32 +462,17 @@ try {
   check('renders with no loadImage without throwing', false, String(error))
 }
 
-// --- one row paints both frames, in the order they happened ------------------------------------
+// --- one row paints the frames of one action, in the order they happened ------------------------
 //
-// Ordering between separate rows is the chat's (`orderedVisibleChatNodes` sorts by `anchorSeq`, and
-// the tool row anchors on `tool/call`, which the Host appends BEFORE the approval event), so an
-// approval-time frame published as its own visible node always lands *below* the result row. The row
-// is therefore the only place "before above, after below" can be guaranteed, and these checks pin
-// that order, the live read of the carrier node, and the refusal de-duplication.
+// Both frames now live in the call's own result content: the frame the user was shown when they
+// approved, then the state after the action. Ordering between separate rows is the chat's
+// (`orderedVisibleChatNodes` sorts by `anchorSeq`, and the tool row anchors on `tool/call`), so the
+// row is the only place "before above, after below" can be guaranteed. The captions come from
+// `presentationMeta.frames`, which names each image's ROLE: a role must never be inferred from an
+// image's position, or a grant whose post-action capture failed would label its before-frame
+// "after the action".
 
 const approvedAttachment = { ...attachment, attachmentId: 'sha256:approved999' }
-
-/**
- * The hidden carrier node the Definition publishes for one call.
- *
- * `visibility: 'hidden'` is what keeps it out of the visible flow; the chat's node store still holds
- * it, which is what makes it readable here.
- */
-const carrierNode = (callId = 'call-1', image = approvedAttachment) => ({
-  key: `cua-preview:${callId}`,
-  kind: 'cua-preview',
-  id: callId,
-  target: 'chat',
-  anchorSeq: 42,
-  visibility: 'hidden',
-  location: { kind: 'step' },
-  data: { attachment: image, callId, action: 'click', toolName: 'browser_act' },
-})
 
 const textOf = (tree) => collect(tree, 'div')
   .map((d) => d.props?.children)
@@ -518,112 +507,113 @@ const framesOf = (tree) => layoutOf(tree)
   .filter((entry) => entry.startsWith('img:') || entry === 'before the action' ||
     entry === 'after the action' || entry === 'at approval time (no action ran)')
 
-/** A granted result: it carries the persisted audit pointer AND the model-facing result frame. */
+const beforeImg = `img:blob:${approvedAttachment.attachmentId}`
+const afterImg = `img:blob:${attachment.attachmentId}`
+
+/** A granted result: the approval-time frame, then the state after the action. */
 const grantedBlock = {
-  ...settledBlock,
+  kind: 'result',
+  isError: false,
+  call: { name: 'browser_act', argsRaw: JSON.stringify({ action: 'click', selector: '#go' }) },
+  content: [
+    { type: 'text', text: 'click #go\napproval: allowed-once (granted: true)' },
+    { type: 'image', attachment: approvedAttachment },
+    { type: 'image', attachment },
+  ],
   meta: {
     decision: 'allowed-once',
     granted: true,
     screenshotPath: '/tmp/after-click.png',
     approvedPath: '/tmp/approval-click.png',
-    approvedFrame: approvedAttachment,
+    frames: ['before', 'after'],
   },
 }
 
 {
-  const withFrame = grantedBlock
-  const tree = render(withFrame, cachedLoader, { useChat: chatWith([carrierNode()]) })
-  const images = collect(tree, 'img')
-  const captions = textOf(tree)
-
-  check('a granted result paints BOTH frames of the action',
-    images.length === 2, `img nodes=${images.length}`)
-  check('the approval-time frame comes from the carrier node, above the result frame',
+  const tree = render(grantedBlock, cachedLoader)
+  check('a granted result paints both frames of the action',
+    collect(tree, 'img').length === 2, `img nodes=${collect(tree, 'img').length}`)
+  check('the frames come out before-above-after, captioning each role',
     JSON.stringify(framesOf(tree)) === JSON.stringify([
       'before the action',
-      `img:blob:${approvedAttachment.attachmentId}`,
+      beforeImg,
       'after the action',
-      `img:blob:${attachment.attachmentId}`,
+      afterImg,
     ]),
     JSON.stringify(framesOf(tree)))
-  check('the result frame is still the model-facing one',
-    images[1]?.props?.src === `blob:${attachment.attachmentId}`,
-    `src=${String(images[1]?.props?.src)}`)
-  check('the persisted audit pointer in meta is still not painted',
-    collect(render(withFrame, cachedLoader), 'img')
-      .every((image) => image.props?.src !== `blob:${approvedAttachment.attachmentId}`),
-    'meta.approvedFrame is an audit pointer, not a rendered frame')
+  check('the approved frame is the one the user saw, not the post-action state',
+    collect(tree, 'img')[0]?.props?.src === `blob:${approvedAttachment.attachmentId}`,
+    `src=${String(collect(tree, 'img')[0]?.props?.src)}`)
 }
 
 {
-  // While the approval is still pending the row has no result: the approval-time frame must already
-  // be on screen, which is the whole point of reading it live from the carrier.
-  const running = {
-    callId: 'call-1',
-    name: 'browser_act',
-    argsRaw: JSON.stringify({ action: 'click', selector: '#go' }),
+  // A grant whose post-action capture failed carries the before-frame alone. Its caption must stay
+  // "before the action": reading the role off `granted` alone would call it the action's effect.
+  const captureFailed = {
+    ...grantedBlock,
+    content: [grantedBlock.content[0], grantedBlock.content[1]],
+    meta: { ...grantedBlock.meta, frames: ['before'], screenshotPath: '' },
   }
-  const tree = render(running, cachedLoader, { useChat: chatWith([carrierNode()]) })
-  check('a pending call already shows the approval-time frame',
-    JSON.stringify(framesOf(tree)) === JSON.stringify([
-      'before the action',
-      `img:blob:${approvedAttachment.attachmentId}`,
-    ]),
+  const tree = render(captureFailed, cachedLoader)
+  check('a grant with no post-action frame captions its single frame "before the action"',
+    JSON.stringify(framesOf(tree)) === JSON.stringify(['before the action', beforeImg]),
     JSON.stringify(framesOf(tree)))
 }
 
 {
-  // The frame is matched by call id: another call's carrier must not paint here. (`settledBlock`
-  // carries no `meta`, so its own result frame is uncaptioned — only the image is expected.)
-  const tree = render(settledBlock, cachedLoader, { useChat: chatWith([carrierNode('call-other')]) })
-  check('a carrier belonging to another call is ignored',
-    JSON.stringify(framesOf(tree)) === JSON.stringify([
-      `img:blob:${attachment.attachmentId}`,
-    ]),
-    JSON.stringify(framesOf(tree)))
-}
-
-{
-  // The selection feeds `useSyncExternalStoreWithSelector`, which compares with `Object.is`.
-  const chat = capturingChat([carrierNode()])
-  render(settledBlock, cachedLoader, { useChat: chat.useChat })
-  const selector = chat.selection()
-  const snapshot = { nodes: { values: () => [carrierNode()] } }
-  check('the selector is reference-stable across reads of equal snapshots',
-    selector !== null && Object.is(selector(snapshot), selector(snapshot)),
-    'a freshly built object here would re-render forever')
-}
-
-{
-  // `visibility: 'hidden'` is what the carrier is: the checks above feed the row exactly the node
-  // the Definition publishes, so a visible carrier would pass them and still be wrong on screen.
-  const carrier = carrierNode()
-  check('the carrier node the checks use is hidden, as the Definition publishes it',
-    carrier.visibility === 'hidden')
-}
-
-{
-  const corrupt = carrierNode('call-1', { attachmentId: '', mediaType: 'image/png' })
-  const tree = render(settledBlock, cachedLoader, { useChat: chatWith([corrupt]) })
-  check('a corrupt carrier attachment paints no approval-time frame',
-    collect(tree, 'img').length === 1, `img nodes=${collect(tree, 'img').length}`)
-}
-
-{
-  // A refusal has no post-action frame: the single content image IS the approval-time state. The
-  // carrier holds that same attachment, so painting it twice would show one picture twice.
+  // A refusal ran nothing, so its single frame IS the approval-time state.
   const refused = {
-    ...settledBlock,
-    meta: { decision: 'rejected', granted: false, screenshotPath: '/tmp/approval-submit.png' },
+    ...grantedBlock,
+    content: [grantedBlock.content[0], grantedBlock.content[1]],
+    meta: {
+      decision: 'rejected',
+      granted: false,
+      screenshotPath: '/tmp/approval-submit.png',
+      frames: ['before'],
+    },
   }
-  const tree = render(refused, cachedLoader, { useChat: chatWith([carrierNode('call-1', attachment)]) })
-  const captions = textOf(tree)
-  check('a refusal renders the shared frame exactly once',
+  const tree = render(refused, cachedLoader)
+  check('a refusal renders its frame exactly once',
     collect(tree, 'img').length === 1, `img nodes=${collect(tree, 'img').length}`)
-  check('a refusal captions its frame as the approval-time state',
-    captions.some((text) => text.includes('at approval time')), JSON.stringify(captions))
-  check('a refusal shows no separate "before the action" block for the same picture',
-    !captions.includes('before the action'), JSON.stringify(captions))
+  check('a refusal captions that frame as the approval-time state',
+    JSON.stringify(framesOf(tree)) === JSON.stringify(['at approval time (no action ran)', beforeImg]),
+    JSON.stringify(framesOf(tree)))
+}
+
+{
+  // A log written by an earlier build has no `frames`: its single image obeys the `granted` rule
+  // that build used, so an old transcript keeps its old caption.
+  const legacyGrant = {
+    ...grantedBlock,
+    content: [grantedBlock.content[0], grantedBlock.content[2]],
+    meta: { decision: 'allowed-once', granted: true, screenshotPath: '/tmp/after-click.png' },
+  }
+  const legacyRefusal = {
+    ...legacyGrant,
+    meta: { decision: 'rejected', granted: false, screenshotPath: '/tmp/approval.png' },
+  }
+  check('a legacy granted result still reads "after the action"',
+    JSON.stringify(framesOf(render(legacyGrant, cachedLoader))) === JSON.stringify(['after the action', afterImg]),
+    JSON.stringify(framesOf(render(legacyGrant, cachedLoader))))
+  check('a legacy refusal still reads "at approval time (no action ran)"',
+    JSON.stringify(framesOf(render(legacyRefusal, cachedLoader))) ===
+      JSON.stringify(['at approval time (no action ran)', afterImg]),
+    JSON.stringify(framesOf(render(legacyRefusal, cachedLoader))))
+}
+
+{
+  // An unknown role — a value a future build wrote — is rendered uncaptioned rather than
+  // mislabelled, and a role list shorter than the content leaves the extra image uncaptioned.
+  const unknownRole = { ...grantedBlock, meta: { ...grantedBlock.meta, frames: ['sideways', 'after'] } }
+  const shortList = { ...grantedBlock, meta: { ...grantedBlock.meta, frames: ['before'] } }
+  check('an unknown frame role paints no caption',
+    JSON.stringify(framesOf(render(unknownRole, cachedLoader))) ===
+      JSON.stringify([beforeImg, 'after the action', afterImg]),
+    JSON.stringify(framesOf(render(unknownRole, cachedLoader))))
+  check('an image past the end of the role list paints no caption',
+    JSON.stringify(framesOf(render(shortList, cachedLoader))) ===
+      JSON.stringify(['before the action', beforeImg, afterImg]),
+    JSON.stringify(framesOf(render(shortList, cachedLoader))))
 }
 
 {
@@ -636,16 +626,15 @@ const grantedBlock = {
   }
   const captions = textOf(render(readOnly, cachedLoader))
   check('a result without metadata renders no caption at all',
-    !captions.some((text) => text.includes('after the action') || text.includes('approved')),
+    !captions.some((text) => text.includes('the action') || text.includes('approval time')),
     JSON.stringify(captions))
 }
 
 const metaCases = [
-  ['malformed metadata', { ...settledBlock, meta: 'nope' }],
-  ['metadata that is an array', { ...settledBlock, meta: [1, 2, 3] }],
-  ['a metadata image that is not an object', { ...settledBlock, meta: { granted: true, approvedFrame: 'x' } }],
-  ['a metadata image with an empty id', { ...settledBlock, meta: { granted: true, approvedFrame: { attachmentId: '' } } }],
-  ['a metadata image with a non-image media type', { ...settledBlock, meta: { granted: true, approvedFrame: { ...approvedAttachment, mediaType: 'text/plain' } } }],
+  ['malformed metadata', { ...grantedBlock, meta: 'nope' }],
+  ['metadata that is an array', { ...grantedBlock, meta: [1, 2, 3] }],
+  ['metadata whose roles are not a list', { ...grantedBlock, meta: { granted: true, frames: 'before' } }],
+  ['metadata with a null role', { ...grantedBlock, meta: { granted: true, frames: [null] } }],
 ]
 
 for (const [label, block] of metaCases) {
@@ -658,8 +647,10 @@ for (const [label, block] of metaCases) {
   }
   check(`renders ${label} without throwing`, threw === null, threw === null ? undefined : String(threw))
   if (threw === null) {
-    check(`  ↳ ${label}: falls back to the model-facing image only`,
-      collect(tree, 'img').length === 1, `img nodes=${collect(tree, 'img').length}`)
+    check(`  ↳ ${label}: the frames still render, uncaptioned`,
+      collect(tree, 'img').length === 2 &&
+        !textOf(tree).some((text) => text === 'before the action' || text === 'after the action'),
+      `img nodes=${collect(tree, 'img').length}`)
   }
 }
 
@@ -676,8 +667,8 @@ for (const [label, block] of metaCases) {
 
 /** Render one stage exactly as 0.2.0-rc.2 hands it over: `phase` beside a stage-specific block. */
 function renderPhase(phase, block, loadImage, options = {}) {
-  const { callId = 'call-1', useChat = emptyChat } = options
-  return expand(Row({ phase, block, callId, loadImage, useChat }))
+  const { callId = 'call-1' } = options
+  return expand(Row({ phase, block, callId, loadImage }))
 }
 
 /** `PreparingToolCall`: identity and placement only — the arguments are not dispatched yet. */
@@ -742,7 +733,8 @@ const spanTexts = (tree) => collect(tree, 'span').map((span) => span.props?.chil
 }
 
 {
-  // A call that has not produced a result paints no result frame, in either spelling.
+  // A call that has not produced a result paints no result frame, in either spelling: the frames of
+  // a gated action arrive with its result.
   const tree = renderPhase('start', startedBlock, cachedLoader)
   check('a started call paints no result frame before its result, in the old spelling too',
     collect(tree, 'img').length === 0, `img nodes=${collect(tree, 'img').length}`)
@@ -763,88 +755,6 @@ const spanTexts = (tree) => collect(tree, 'span').map((span) => span.props?.chil
   check('an unknown future stage degrades to running rather than to a result',
     collect(tree, 'img').length === 0 && spanTexts(tree).includes('click #go'),
     JSON.stringify(spanTexts(tree)))
-}
-
-// ---------------------------------------------------------------------------------------------
-// The Conversation Definition: the approval-time frame becomes a live, HIDDEN carrier node.
-// ---------------------------------------------------------------------------------------------
-
-const definition = definitions[0]
-
-check('the Definition declares the plugin-owned kind and the chat target',
-  definition?.kind === 'cua-preview' && definition?.target === 'chat',
-  `kind=${definition?.kind} target=${definition?.target}`)
-check('the Definition declares match/start/update/buildViewNode',
-  ['match', 'start', 'update', 'buildViewNode'].every((key) => typeof definition?.[key] === 'function'))
-
-const eventSeq = 42
-const previewEvent = {
-  type: 'cua/preview',
-  seq: eventSeq,
-  time: 0,
-  data: {
-    content: [{ type: 'image', attachment: approvedAttachment }],
-    callId: 'call-1',
-    action: 'click',
-    toolName: 'browser_act',
-  },
-}
-
-{
-  const match = definition.match(previewEvent)
-  check('the Definition matches the plugin event',
-    match?.role === 'start' && match?.id === 'call-1', JSON.stringify(match))
-  check('the Definition ignores every other event type',
-    definition.match({ type: 'tool/result', seq: 1, data: {} }) === null &&
-      definition.match({ type: 'cua/preview', seq: 2, data: { content: [] } }) === null &&
-      definition.match({ type: 'cua/preview', seq: 3, data: { content: [{ type: 'image', attachment: { attachmentId: '' } }] } }) === null)
-  check('a malformed event is rejected rather than rendered',
-    definition.match({ type: 'cua/preview', seq: 4 }) === null)
-  check('an event without a call id falls back to its own seq as identity',
-    definition.match({ type: 'cua/preview', seq: 9, data: { content: [{ type: 'image', attachment }] } })?.id === '9')
-}
-
-{
-  const context = {
-    key: 'cua-preview:call-1',
-    kind: 'cua-preview',
-    id: 'call-1',
-    matches: [{ event: previewEvent, role: 'start', location: { kind: 'step' } }],
-    start: { event: previewEvent, role: 'start', location: { kind: 'step' } },
-    state: undefined,
-    current: new Map(),
-  }
-  const state = definition.start(context, context.start)
-  const node = definition.buildViewNode({ ...context, state })
-  check('the Definition publishes a chat node for the event',
-    node?.kind === 'cua-preview' && node?.target === 'chat',
-    JSON.stringify(node))
-  check('the published node is HIDDEN: Client state, not a second visible row',
-    node?.visibility === 'hidden',
-    `visibility=${String(node?.visibility)} — a visible carrier sorts below the tool row, because ` +
-      'the chat orders nodes by anchorSeq and the approval event follows tool/call')
-  check('the node keeps the engine key and anchors on the event seq',
-    node?.key === context.key && node?.anchorSeq === eventSeq,
-    `key=${node?.key} anchorSeq=${node?.anchorSeq}`)
-  check('the node data carries the durable reference and the call id',
-    node?.data?.attachment?.attachmentId === approvedAttachment.attachmentId &&
-      node?.data?.callId === 'call-1',
-    JSON.stringify(node?.data))
-  check('a Context with no image publishes no node',
-    definition.buildViewNode({ ...context, state: { attachment: null } }) === null)
-
-  // End to end through the bundle's own pieces: the node the Definition publishes is exactly what
-  // the row reads back through `useChat`, and the frames come out in the reported-wrong order fixed.
-  const published = definition.buildViewNode({ ...context, state })
-  const tree = render(grantedBlock, cachedLoader, { callId: 'call-1', useChat: chatWith([published]) })
-  check('the published node, fed back to the row, paints before-above-after',
-    JSON.stringify(framesOf(tree)) === JSON.stringify([
-      'before the action',
-      `img:blob:${approvedAttachment.attachmentId}`,
-      'after the action',
-      `img:blob:${attachment.attachmentId}`,
-    ]),
-    JSON.stringify(framesOf(tree)))
 }
 
 // ---------------------------------------------------------------------------------------------

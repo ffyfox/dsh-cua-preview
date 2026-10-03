@@ -90,15 +90,15 @@ The task allowed Puppeteer or Playwright. Puppeteer was chosen, and specifically
 
 The approval happens **before** the action, so two frames exist and each is named for what it is. The
 **post-action** frame is what the model receives as its result image, because a model that reads a
-pre-action frame as "the result" concludes the action failed. The **approval-time** frame is what the
-user is shown while deciding; it is carried on a log-only session event of the plugin's own, read by the
-Client half, and painted in the same row as the result — so during a pending approval the picture is
-already on screen. `result.meta` keeps the audit pointer without being painted. On a refusal there is
-no post-action state, so the one image returned *is* the approval-time frame. A screen that is genuinely
-blank (an unloaded, empty tab) emits no frame at all rather than a useless white rectangle.
-
-[docs/design.md](docs/design.md) explains the mechanisms, and why the frame cannot travel inside the
-approval request.
+pre-action frame as "the result" concludes the action failed. The **approval-time** frame — the screen
+the user was asked to approve — is returned in the same result, first, captioned `before the action`, so
+the call's row reads as a timeline. Both ride in the call's own `tool/result` content, which is what makes
+them readable: the Host authorizes an attachment read only when a known event's content carries the
+reference, and `presentationMeta.frames` names each one's role. A plugin-owned session event cannot be
+used for this at all (it would make the session unopenable — see `docs/design.md`). On a refusal no action
+ran, so the one image returned *is* the approval-time frame, captioned `at approval time (no action ran)`.
+A screen that is genuinely blank (an unloaded, empty tab) emits no frame at all rather than a useless
+white rectangle.
 
 ## What the model is told when the user says no
 
@@ -166,7 +166,7 @@ node examples/test-page/serve.mjs --port 3097 --host 127.0.0.1
 
 | Document | Contents |
 |---|---|
-| [docs/design.md](docs/design.md) | how it works and why: the two frames, the image channels, the hidden carrier node, the slots this plugin refuses to touch, the locale and refusal rules |
+| [docs/design.md](docs/design.md) | how it works and why: the two frames, the image channels, why no plugin-owned session event may carry one, the slots this plugin refuses to touch, the locale and refusal rules |
 | [CHANGELOG.md](CHANGELOG.md) | what changed |
 
 ## License

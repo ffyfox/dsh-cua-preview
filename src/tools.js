@@ -52,31 +52,72 @@ const IMAGE_VALUE_SCHEMA = {
   },
 }
 
-/** Build the model-facing content for a result that carries an optional durable image. */
-function imageContent(text, image) {
+/**
+ * Build the model-facing content for a result that carries zero or more durable images.
+ *
+ * The reference must sit in `content` — the position the Host's attachment authorizer scans
+ * (`imageInEvent`) — because a reference carried only by `result.meta` is persisted but not
+ * readable, and a card built on it renders "screenshot could not be loaded".
+ *
+ * @param {string} text - the result text.
+ * @param {object|object[]|null} [images] - one reference, a list of them, or nothing.
+ * @returns {object[]} the content blocks.
+ */
+function imageContent(text, images) {
   const blocks = [{ type: 'text', text }]
-  if (image !== null && image !== undefined) {
-    blocks.push({ type: 'image', attachment: image })
+  for (const entry of images === null || images === undefined
+    ? []
+    : Array.isArray(images) ? images : [images]) {
+    if (entry === null || entry === undefined) continue
+    // A frame record carries its role beside the reference (`gatedFrames`); a bare
+    // `ImageAttachmentRef` — what `browser_screenshot` passes — is used as it stands.
+    const attachment = entry.attachment ?? entry
+    blocks.push({ type: 'image', attachment })
   }
   return blocks
 }
 
 /**
+ * The images one gated result carries, in the order the card paints them.
+ *
+ * `approvalImage` is the screen captured BEFORE the ask and `image` is the state after the action,
+ * so a grant shows a two-frame timeline ("before the action" above "after the action") inside the
+ * call's own row. A refusal ran nothing: its single frame *is* the approval-time screen, so it is
+ * reported once, as the before frame.
+ *
+ * @param {object} value - the canonical execution value.
+ * @returns {object[]} frame records in presentation order.
+ */
+function gatedFrames(value) {
+  const frames = []
+  if (value.granted === false) {
+    if (value.image !== undefined) frames.push({ role: 'before', attachment: value.image })
+    return frames
+  }
+  if (value.approvalImage !== undefined) frames.push({ role: 'before', attachment: value.approvalImage })
+  if (value.image !== undefined) frames.push({ role: 'after', attachment: value.image })
+  return frames
+}
+
+/**
  * Project the card facts for one approval-gated action.
  *
- * Two documented channels carry result-time facts, and they do different jobs here:
+ * `output.presentationMeta` is persisted by the core on `tool/result` as `result.meta`, transported
+ * by the session log, and read back by a Client toolview from `ToolResultNode.meta`
+ * (`docs/cookbook/adding-a-tool.md`: "Project durable card data with `presentationMeta`"; "UI-only
+ * formatting stays out of the model result"). It tells the card *what* to render and how to caption
+ * it, and it survives replay.
  *
- * - `output.presentationMeta` (this function) is persisted by the core on `tool/result` as
- *   `result.meta`, transported by the session log, and read back by a Client toolview from
- *   `ToolResultNode.meta` (`docs/cookbook/adding-a-tool.md`: "Project durable card data with
- *   `presentationMeta`"; "UI-only formatting stays out of the model result"). It tells the card
- *   *what* to render and how to caption it, and it survives replay.
- * - The approved frame's **readability** is a separate matter, and `meta` cannot grant it: the Host
- *   authorizes an attachment read by scanning the Session log for an event whose content carries
- *   that reference (`dsh-api-session-controller`'s `referencedImage`), and it scans only
- *   `data.content`, `data.message.content`, `data.inserted[].content` and assistant stream chunks.
- *   The broker therefore references the frame from a plugin-owned log-only event as well — see
- *   `approval-broker.js`. `meta` alone produced a card that said "could not be loaded".
+ * `frames` names the role of every image the result carries, in order, so the card does not have to
+ * guess a caption from `granted` alone: `['before', 'after']` for a granted action, `['before']` for
+ * a refusal or for a grant whose post-action capture failed. The role — not the position — is what
+ * the caption is built from, because a missing after-frame must not shift the before-frame's label.
+ *
+ * Readability is a separate matter, and `meta` cannot grant it: the Host authorizes an attachment
+ * read by scanning the Session log for a known event whose content carries that reference
+ * (`dsh-api-session-controller`'s `referencedImage`). That is why both frames are references inside
+ * the `tool/result` content rather than metadata (see `approval-broker.js` for why no plugin-owned
+ * event may be appended instead).
  *
  * @param {object} value - the canonical execution value.
  * @returns {object} plain, JSON-safe card facts.
@@ -90,11 +131,25 @@ function gatedPresentationMeta(value) {
     ...(value.approvalScreenshotPath === undefined
       ? {}
       : { approvedPath: value.approvalScreenshotPath }),
-    // The approved frame's durable reference, present only when (a) a distinct post-action frame is
-    // the model-facing one — on a refusal the single frame already IS the approval-time state — and
-    // (b) the Session log really references it, so the card never asks for bytes the Host refuses.
-    ...(value.approvalImage === undefined ? {} : { approvedFrame: value.approvalImage }),
+    frames: gatedFrames(value).map((frame) => frame.role),
   }
+}
+
+/**
+ * Persist the approval-time frame so a gated result can carry it.
+ *
+ * The bytes are the broker's own capture; a frame-less ask (blank screen, capture failure) and a
+ * failed save both yield null rather than an image the Host would refuse to serve.
+ *
+ * @param ctx - plugin context carrying the optional attachment store.
+ * @param outcome - the broker result.
+ * @param logger - optional logger.
+ * @returns {Promise<object|null>} the serialized `ImageAttachmentRef`, or null.
+ */
+async function saveApprovalFrame(ctx, outcome, logger) {
+  const shot = outcome?.screenshot
+  if (shot === null || shot === undefined || shot.data === undefined) return null
+  return saveScreenshotAttachment(ctx, shot, logger)
 }
 
 /**
@@ -117,9 +172,11 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
       'If the result says the user rejected (or cancelled) the request, the navigation did not ' +
       'happen: that is a decision by the user, not a failure — do not retry the same navigation, ' +
       'stop and ask the user what to change or what to do next. ' +
-      'The returned screenshot shows the page AFTER navigation, so it is the result. The screen ' +
-      'seen at approval time is shown to the user in the conversation, not returned here (and a ' +
-      'first navigation from a blank tab has no such screen).',
+      'The returned screenshot shows the page AFTER navigation, so it is the result. ' +
+      'A granted navigation returns two images in order: first the screen the user was shown when ' +
+      'they approved it (the card captions that one "before the action"), then the frame after ' +
+      'navigation. A first navigation from a blank tab has no approval-time screen and returns one ' +
+      'image; a refusal returns the approval-time screen alone.',
     parameters: {
       url: { type: 'string', required: true, description: 'Absolute http(s) URL to open' },
     },
@@ -145,6 +202,9 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
               `title: ${value.title}`,
               `approval: ${value.decision}`,
               // A blank-screen approval carries no frame, so it names no path either.
+              ...(value.approvalScreenshotPath === undefined
+                ? []
+                : [`screenshot (state at approval time): ${value.approvalScreenshotPath}`]),
               ...(value.screenshotPath === '' ? [] : [`screenshot (after navigation): ${value.screenshotPath}`]),
             ].join('\n')
           : [
@@ -163,7 +223,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
                 ? []
                 : [`screenshot (state at approval time; no navigation ran): ${value.screenshotPath}`]),
             ].join('\n'),
-        value.image,
+        gatedFrames(value),
       ),
       presentationMeta: (_args, value) => gatedPresentationMeta(value),
     },
@@ -180,9 +240,10 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
         callId: exec.callId,
         signal: exec.signal,
       })
-      if (!outcome.granted) return refusedNavigate(browser, outcome)
+      if (!outcome.granted) return refusedNavigate(ctx, browser, outcome, logger)
       const result = await browser.navigate(args.url, exec.signal)
       const after = await captureResult(ctx, browser, broker, logger, 'navigate')
+      const before = await saveApprovalFrame(ctx, outcome, logger)
       return {
         url: result.url,
         title: result.title,
@@ -191,10 +252,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
         screenshotPath: after.path,
         ...(outcome.screenshot?.path === undefined ? {} : { approvalScreenshotPath: outcome.screenshot.path }),
         ...(after.attachment === null ? {} : { image: after.attachment }),
-        ...(outcome.frameAdmitted === true && outcome.attachmentRef !== null
-          && outcome.attachmentRef !== undefined
-          ? { approvalImage: outcome.attachmentRef }
-          : {}),
+        ...(before === null ? {} : { approvalImage: before }),
       }
     },
   }))
@@ -277,10 +335,12 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
       'equivalent one, stop and ask the user what to change or what to do next. ' +
       'Actions: `click` (activate a control), `fill` (replace a field\'s contents; it ' +
       'clears the field first rather than appending), `submit` (submit a form). ' +
-      'The image in this result is the screen AFTER the action ran, so it shows the action\'s ' +
-      'effect — no follow-up screenshot is needed to confirm it. The screen the user approved is ' +
-      'shown to them in the conversation while they decide and is NOT part of this result; its ' +
-      'file path, when there is one, is reported as `approvalScreenshotPath` for audit.',
+      'This result carries up to two images, in this order: the screen the user was shown when ' +
+      'they approved the action (the card captions that one "before the action" — it is the frame ' +
+      'they reviewed, and it is NOT the action\'s effect), then the screen AFTER the action ran. ' +
+      'That second frame is normally the action\'s effect, so no follow-up screenshot is needed to ' +
+      'confirm it. A refusal returns the approval-time frame alone. Each frame\'s file ' +
+      'path is reported in the result text for audit.',
     parameters: {
       action: {
         type: 'string',
@@ -321,6 +381,9 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
               `approval: ${value.decision} (granted: true)`,
               `page: ${value.url}`,
               // A blank-screen approval carries no frame, so it names no path either.
+              ...(value.approvalScreenshotPath === undefined
+                ? []
+                : [`screenshot (state at approval time): ${value.approvalScreenshotPath}`]),
               ...(value.screenshotPath === '' ? [] : [`screenshot (state AFTER the action): ${value.screenshotPath}`]),
             ].join('\n')
           : [
@@ -340,7 +403,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
                 ? []
                 : [`screenshot (state at approval time; no action ran): ${value.screenshotPath}`]),
             ].join('\n'),
-        value.image,
+        gatedFrames(value),
       ),
       presentationMeta: (_args, value) => gatedPresentationMeta(value),
     },
@@ -374,6 +437,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
       // post-action state to show, so it reports the approval-time frame instead.
       if (!outcome.granted) {
         const state = await browser.snapshot()
+        const before = await saveApprovalFrame(ctx, outcome, logger)
         return {
           action: args.action,
           selector: args.selector,
@@ -381,7 +445,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
           decision: outcome.decision,
           url: state.url,
           screenshotPath: outcome.screenshot?.path ?? '',
-          ...(outcome.attachmentRef === null ? {} : { image: outcome.attachmentRef }),
+          ...(before === null ? {} : { image: before }),
         }
       }
 
@@ -391,6 +455,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
 
       const state = await browser.snapshot()
       const after = await captureResult(ctx, browser, broker, logger, args.action)
+      const before = await saveApprovalFrame(ctx, outcome, logger)
       return {
         action: args.action,
         selector: args.selector,
@@ -400,10 +465,7 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
         screenshotPath: after.path,
         ...(outcome.screenshot?.path === undefined ? {} : { approvalScreenshotPath: outcome.screenshot.path }),
         ...(after.attachment === null ? {} : { image: after.attachment }),
-        ...(outcome.frameAdmitted === true && outcome.attachmentRef !== null
-          && outcome.attachmentRef !== undefined
-          ? { approvalImage: outcome.attachmentRef }
-          : {}),
+        ...(before === null ? {} : { approvalImage: before }),
       }
     },
   }))
@@ -515,9 +577,16 @@ async function saveScreenshotAttachment(ctx, shot, logger) {
  *
  * The page is untouched on a refusal, so the honest result is the *current* page state — not a
  * fabricated URL.
+ *
+ * @param ctx - plugin context carrying the optional attachment store.
+ * @param browser - the browser control layer.
+ * @param outcome - the broker result.
+ * @param logger - optional logger.
+ * @returns {Promise<object>} the tool result value.
  */
-async function refusedNavigate(browser, outcome) {
+async function refusedNavigate(ctx, browser, outcome, logger) {
   const state = await browser.snapshot()
+  const before = await saveApprovalFrame(ctx, outcome, logger)
   return {
     url: state.url,
     // The honest title of the page that is still open. It used to carry "navigate was not approved
@@ -530,8 +599,6 @@ async function refusedNavigate(browser, outcome) {
     // honest state to report. It may legitimately be absent (blank screen, capture failure),
     // which is why the schema declares both image fields optional.
     screenshotPath: outcome.screenshot?.path ?? '',
-    ...(outcome.attachmentRef === null || outcome.attachmentRef === undefined
-      ? {}
-      : { image: outcome.attachmentRef }),
+    ...(before === null ? {} : { image: before }),
   }
 }
