@@ -123,6 +123,45 @@ function settleNote(value) {
 }
 
 /**
+ * The URL the model actually asked to open, or `null` when the call carried none.
+ *
+ * `value.url` is where the browser **is**: a refusal leaves it untouched and a redirect changes it,
+ * so it can never stand in for the request. Labelling it as one is exactly what made a refused
+ * navigation name the wrong target — the page it was still on, presented as the thing that was
+ * refused. The request exists only in the call's own arguments, which the dispatcher passes to
+ * `render` as its first parameter (`tool.output.render(exec.arguments, value)`).
+ *
+ * `null` rather than a fallback to `value.url`: when the arguments are unavailable, the honest
+ * answer is "this render does not know what was asked", so the caller drops the line instead of
+ * printing the current page under a `request:` label.
+ *
+ * @param {object} args - the validated tool arguments.
+ * @returns {string|null} the requested URL, or null when it is not known.
+ */
+function askedUrl(args) {
+  return typeof args?.url === 'string' && args.url !== '' ? args.url : null
+}
+
+/**
+ * Whether two URLs name different pages — used only to decide if `landed at:` is worth a line.
+ *
+ * `http://host:port` and `http://host:port/` are the same request to the same page, and a line that
+ * fired on that would be noise on an ordinary navigation. Anything unparseable falls back to a
+ * strict comparison, so the line errs towards being shown rather than hidden.
+ *
+ * @param {string} asked - the requested URL.
+ * @param {string} landed - the URL the browser reports afterwards.
+ * @returns {boolean} true when the two are the same page.
+ */
+function samePage(asked, landed) {
+  try {
+    return new URL(asked).href === new URL(landed).href
+  } catch {
+    return asked === landed
+  }
+}
+
+/**
  * Wait for the page to stop changing, and shape the wait into result fields.
  *
  * Returns a spreadable object rather than a value so a settle that was skipped (config
@@ -263,37 +302,49 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
           networkBusy: { type: 'boolean' },
         },
       },
-      render: (_args, value) => imageContent(
-        value.granted
-          ? [
-              `navigate -> ${value.url}`,
-              `title: ${value.title}`,
-              `approval: ${value.decision}`,
-              // A blank-screen approval carries no frame, so it names no path either.
-              ...(value.approvalScreenshotPath === undefined
-                ? []
-                : [`screenshot (state at approval time): ${value.approvalScreenshotPath}`]),
-              ...(value.screenshotPath === '' ? [] : [`screenshot (after navigation): ${value.screenshotPath}`]),
-              ...settleNote(value),
-            ].join('\n')
-          : [
-              // The notice leads, so the first thing the model reads is that a human said no.
-              refusalNotice({
-                toolName: 'browser_navigate',
-                decision: value.decision,
-                language: approvalLanguageOf(ctx),
-              }),
-              '',
-              `request: navigate -> ${value.url}`,
-              `approval: ${value.decision} (granted: false)`,
-              // On a refusal the frame is the screen the user was looking at, and it is the honest
-              // current state: nothing changed it.
-              ...(value.screenshotPath === ''
-                ? []
-                : [`screenshot (state at approval time; no navigation ran): ${value.screenshotPath}`]),
-            ].join('\n'),
-        gatedFrames(value),
-      ),
+      render: (args, value) => {
+        const asked = askedUrl(args)
+        return imageContent(
+          value.granted
+            ? [
+                `navigate -> ${asked ?? value.url}`,
+                // A redirect — or `page.goto` normalising the URL — lands somewhere other than what
+                // was asked for. Naming both keeps "what I requested" and "where the browser is"
+                // from collapsing into one claim.
+                ...(asked === null || samePage(asked, value.url) ? [] : [`landed at: ${value.url}`]),
+                `title: ${value.title}`,
+                `approval: ${value.decision}`,
+                // A blank-screen approval carries no frame, so it names no path either.
+                ...(value.approvalScreenshotPath === undefined
+                  ? []
+                  : [`screenshot (state at approval time): ${value.approvalScreenshotPath}`]),
+                ...(value.screenshotPath === '' ? [] : [`screenshot (after navigation): ${value.screenshotPath}`]),
+                ...settleNote(value),
+              ].join('\n')
+            : [
+                // The notice leads, so the first thing the model reads is that a human said no.
+                refusalNotice({
+                  toolName: 'browser_navigate',
+                  decision: value.decision,
+                  language: approvalLanguageOf(ctx),
+                }),
+                '',
+                // Dropped, never guessed: `value.url` is the page the browser is still on, and
+                // printing it here is the defect this line exists for.
+                ...(asked === null ? [] : [`request: navigate -> ${asked}`]),
+                `approval: ${value.decision} (granted: false)`,
+                // The sibling gated tool states the untouched page on its own line; a refused
+                // navigation owes the model the same fact, stated as a fact.
+                `page: ${value.url}`,
+                // On a refusal the frame is the screen the user was looking at, and it is the honest
+                // current state: nothing changed it.
+                ...(value.screenshotPath === ''
+                  ? []
+                  : [`screenshot (state at approval time; no navigation ran): ${value.screenshotPath}`]),
+              ].join('\n'),
+          gatedFrames(value),
+        )
+      },
       presentationMeta: (_args, value) => gatedPresentationMeta(value),
     },
     async execute(args, exec) {

@@ -507,7 +507,14 @@ console.log('\n--- approval credential channel ---\n')
 
 console.log('\n--- navigation ---\n')
 
-const navServer = createServer((_request, response) => {
+const navServer = createServer((request, response) => {
+  // A redirect, so the granted path can be pinned on the one case where "what was asked for" and
+  // "where the browser landed" are genuinely different URLs.
+  if (request.url === '/redirect') {
+    response.writeHead(302, { location: '/' })
+    response.end()
+    return
+  }
   response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
   response.end('<!doctype html><html><head><title>CUA navigate page</title></head>' +
     '<body><h1>NAVIGATED</h1></body></html>')
@@ -606,6 +613,40 @@ try {
   check('the second navigate credential is not the blank tab',
     !(await readFile(secondNav.approvalScreenshotPath)).equals(blank.data),
     secondNav.approvalScreenshotPath)
+
+  // ---- What was asked for vs where the browser is ---------------------------------------------
+  //
+  // A navigation can end somewhere other than the URL that was asked for: a refusal never moves the
+  // browser at all, a redirect moves it past the request. Both rendered branches therefore take the
+  // request from the call's own arguments and state the browser's page as its own fact.
+  const redirectUrl = `${navUrl}redirect`
+  auditSeen()
+  const redirectNav = await navTool.execute(
+    { url: redirectUrl },
+    { ...execBase, callId: brandString('call-cua-acceptance-navigate-redirect') },
+  )
+  auditSeen()
+  const redirectText = navTool.output.render({ url: redirectUrl }, redirectNav)
+    .find((block) => block.type === 'text').text
+  check('a redirected navigation names the URL that was asked for, not the one it landed on',
+    redirectText.split('\n')[0] === `navigate -> ${redirectUrl}`,
+    JSON.stringify(redirectText.split('\n')[0]))
+  check('a redirected navigation says where the browser actually landed',
+    redirectNav.url === navUrl && redirectText.includes(`landed at: ${navUrl}`),
+    `landed=${redirectNav.url} text=${JSON.stringify(redirectText)}`)
+
+  // `http://host:port` and `http://host:port/` are the same request to the same page, so the extra
+  // line must not fire on that difference: an ordinary navigation still reads as one line.
+  const slashlessUrl = navUrl.slice(0, -1)
+  const slashlessNav = await navTool.execute(
+    { url: slashlessUrl },
+    { ...execBase, callId: brandString('call-cua-acceptance-navigate-slashless') },
+  )
+  const slashlessText = navTool.output.render({ url: slashlessUrl }, slashlessNav)
+    .find((block) => block.type === 'text').text
+  check('a trailing-slash difference does not produce a "landed at" line',
+    !slashlessText.includes('landed at:'),
+    JSON.stringify(slashlessText.split('\n').slice(0, 2)))
 } finally {
   await new Promise((done) => navServer.close(done))
 }
@@ -916,6 +957,36 @@ check('a rejected approval performs no action',
     refusedImages.length === 1 &&
       refusedImages[0].attachment.attachmentId === refused.image?.attachmentId,
     `images=${refusedImages.length}`)
+}
+
+// A refused navigation must name the URL that was ASKED for. It used to print the page the browser
+// was still on under the `request:` label, so the model was told the wrong target had been refused —
+// in the one result that also orders it not to retry. The defect was long-lived because this path
+// (and only this one) was never rendered by any test; these checks exist to keep it covered.
+//
+// The requested URL is deliberately never resolved: the navigation is refused, so nothing should
+// touch it — which is itself the point.
+{
+  const askedFor = 'http://127.0.0.1:1/never-reached'
+  const refusedNav = await rejectHandle.navTool.execute(
+    { url: askedFor },
+    { agent: rejectHandle.agent, signal: new AbortController().signal },
+  )
+  const refusedNavText = rejectHandle.navTool.output.render({ url: askedFor }, refusedNav)
+    .find((block) => block.type === 'text').text
+  const lines = refusedNavText.split('\n')
+
+  check('a refused navigation is reported as not granted',
+    refusedNav.granted === false, `decision=${refusedNav.decision}`)
+  check('a refused navigation names the URL that was asked for',
+    lines.includes(`request: navigate -> ${askedFor}`),
+    JSON.stringify(lines.find((line) => line.startsWith('request:'))))
+  check('a refused navigation states the untouched page on its own line, like its sibling tool',
+    lines.includes(`page: ${refusedNav.url}`) && refusedNav.url === 'about:blank',
+    JSON.stringify(lines.find((line) => line.startsWith('page:'))))
+  check('a refused navigation never reports the current page as the request',
+    !lines.includes(`request: navigate -> ${refusedNav.url}`),
+    JSON.stringify(lines.find((line) => line.startsWith('request:'))))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1412,6 +1483,9 @@ async function buildRejectingRuntime(context, dir) {
   return {
     browser: cuaPreview.browser,
     tool: context.tools.get('browser_act'),
+    // The refused-navigation path renders differently from the refused-action path, and it had NO
+    // coverage at all — which is how it kept naming the current page as the request.
+    navTool: context.tools.get('browser_navigate'),
     agent,
     dispose: async () => { await context.stop?.() },
   }

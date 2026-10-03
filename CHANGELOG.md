@@ -88,6 +88,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   returned `false` while every call failed. Operations that cannot have produced a side effect — and
   navigation, which is harmless to repeat — are retried once against a re-established page; `click`,
   `fill` and `submit` are not, because replaying an input whose delivery is unknown can double-act.
+- **A refused `browser_navigate` named the wrong target.** The refusal printed the page the browser was
+  still on under a `request:` label — `request: navigate -> <the page you are already on>` — so the model
+  was told that something it never asked for had been refused, in the one result that also orders it not
+  to retry. `refusedNavigate()` reporting the untouched page as a *fact* is right; the render cannot
+  borrow that fact for the *request*, which exists only in the call's own arguments (the dispatcher
+  passes them to `render` as its first parameter). The refusal now states `request: navigate -> <asked>`
+  followed by `page: <still open>`, the same two lines the sibling `browser_act` refusal already
+  produced. Also present in `0.1.0`: it survived because no test ever rendered this path — every
+  refusal check drove `browser_act` — so seven checks were added, and they were shown to fail against
+  the old behaviour before the fix was kept.
 
 ### Changed
 
@@ -115,6 +125,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `danger-full-access` gets `approval: never`, under which `ApprovalService.decide()` returns
   "rejected" *before* the `approval/request` waterfall — so the probe's own answerer was unreachable and
   the run described the operator's preset rather than the plugin.
+- A granted `browser_navigate` now reports the URL that was **asked for** on its first line, and adds
+  `landed at: <final URL>` only when the two differ, so a redirect is no longer indistinguishable from
+  an ordinary load. `http://host:port` and `http://host:port/` count as the same page, so a plain
+  navigation still reads as one line.
 
 ### Notes
 

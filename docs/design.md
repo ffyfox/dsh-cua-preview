@@ -321,6 +321,39 @@ and `ToolExecution` carries no turn identity (only `callId`/`rootCallId`/`agent`
 which to scope such suppression to one model turn. The refusal notice therefore invites the user to
 say what to change, and tells the model to wait for that.
 
+### The request and the page are two different facts
+
+A navigation value carries one URL string, `value.url`, and it means where the browser **is**. That is the
+right fact for a result, and the wrong one to label as the request:
+
+- on a **refusal** the browser has not moved, so `value.url` is the page that is still open;
+- on a **redirect** it moved past the request, so `value.url` is only where it landed.
+
+The request exists solely in the call's own arguments, which `dsh-tools` hands to `render` as its first
+parameter (`tool.output.render(exec.arguments, value)`). Both rendered branches therefore state the request
+from there and give the browser's own URL its own line:
+
+```text
+# a refusal
+request: navigate -> http://127.0.0.1:3097/slow.html
+approval: rejected (granted: false)
+page: about:blank
+
+# a grant that was redirected
+navigate -> http://127.0.0.1:9090/redirect
+landed at: http://127.0.0.1:9090/
+```
+
+`refusedNavigate()` reporting the untouched page as `url` is correct and stays — the defect was never that
+fact, it was the render borrowing it for `request:`, which told the model that something it had never asked
+for had been refused, inside the one result that also orders it not to retry. `landed at:` appears only when
+the two URLs name different pages, with `http://host:port` and `http://host:port/` counted as the same page,
+so an ordinary navigation still reads as one line. When the arguments are unavailable the request line is
+dropped rather than guessed: a wrong `request:` is worse than no `request:`. This path shipped unnoticed in
+`0.1.0` because no test rendered it — every refusal check drove `browser_act` — so the acceptance suite now
+refuses a `browser_navigate` and a redirects a granted one, and both were verified to fail against the old
+behaviour.
+
 ## Fail-closed rules
 
 Both gates fail closed, and the fail-closed-ness is verified rather than asserted:
