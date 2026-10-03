@@ -168,6 +168,25 @@ absent channel: `rejected` and `cancelled` are described as the user's decision,
 states explicitly that it was **not**. The same rule is in the gated tools' descriptions, so it reaches
 the model before it acts rather than only afterwards.
 
+**`rejected` has two sources, and only one of them involves a person.** Under the `ask` policy it means
+an answerer said no. Under `never` — which is what the shipped `danger-full-access` preset selects, since
+that preset bundles "full file access" with "no approval prompts" — DSH's `ApprovalService.decide()`
+returns `rejected` *before* the `approval/request` waterfall, so no prompt exists and nobody is asked.
+Telling the model "the user rejected it" there is a false attribution, and a costly one: it would send
+the model off to wait for a user who has already answered, by turning prompts off. The plugin therefore
+reads `ctx.approval.effectivePolicy(session)` (the documented accessor) and words that refusal
+differently — no human decided, the session policy did, and the way to unblock it is `/permission`.
+
+```text
+browser_act was NOT performed: this session's approval policy is "never", so DSH rejected it automatically, before any answerer could be asked.
+the user did NOT reject tool "browser_act" — under the "never" policy no approval prompt exists and no answerer is asked, so no human took this decision. Nothing ran and the page is unchanged.
+DSH states the session's policy to the model as: "Approval prompts are disabled in this session: actions that require approval are rejected automatically."
+Do not retry this action or an equivalent one. Tell the user what was refused, and ask them to run /permission and switch to a preset whose approval policy is "ask" — a preset can keep full file access and still ask (the shipped "danger-full-access" preset pairs full file access with no prompts, which is what disables this).
+```
+
+An unreadable policy degrades to the interactive wording, because that is the only case the plugin can
+prove; it never invents a claim about who decided.
+
 Repeat prompting is **not** suppressed: the plugin does not police the model's retries, and a user who
 changes their mind can still approve a later attempt. Suppressing an identical repeat would end the
 popup loop mechanically, but it can also block a user who has since said "go ahead", and a tool
@@ -187,11 +206,11 @@ Three entries, aimed at three different layers:
 
 | Entry | Layer | Needs | Checks |
 |---|---|---|---|
-| `npm run test:client` | the Client half, in isolation | Node only | 79 |
-| `npm run test:acceptance` | the Host half, against the real DSH services | Chrome | 107 |
-| `npm run test:real-load` | both halves, inside a real `dsh` process | a `dsh` CLI + Chrome | 18 |
+| `npm run test:client` | the Client half, in isolation | Node only | 97 |
+| `npm run test:acceptance` | the Host half, against the real DSH services | Chrome | 169 |
+| `npm run test:real-load` | both halves, inside a real `dsh` process | a `dsh` CLI + Chrome | 24 |
 
-That is **204 checks, 0 failures** — all three entries need `npm install` first. The last entry boots the
+That is **290 checks, 0 failures** — all three entries need `npm install` first. The last entry boots the
 shipped `dsh` binary with the plugin patched in on an OS-assigned free port — so it cannot collide with
 any profile you have running — and runs a probe plugin inside that process which reads the live
 registries. It reports clearly and exits non-zero if no `dsh` CLI is available. It pins the approval

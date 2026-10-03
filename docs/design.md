@@ -314,6 +314,30 @@ explicitly that it **was not** a decision by the user. The same rule is written 
 `description`, so it is in the system prompt *before* the model acts, not only in the result
 afterwards.
 
+### `rejected` has two sources, and only one involves a person
+
+`rejected` is the right outcome for "a human declined" under the `ask` policy. Under `never` the same
+value arrives for a completely different reason: `ApprovalService.decide()` returns it *before* the
+`approval/request` waterfall is dispatched, so no prompt exists and no answerer is consulted
+(`docs/subsystems/approval.md`: "`never` deterministically returns `rejected` without dispatching any
+answerer"). Nothing about the four-value outcome vocabulary distinguishes the two, so the plugin reads
+the policy itself — `ctx.approval.effectivePolicy(session)`, which the same doc line names as the
+consumer's read — **before** raising the request (reading it afterwards would describe the wrong
+decision if the user switched presets mid-ask).
+
+Only the two documented vocabulary values are accepted. A Host that removes the accessor, renames it, or
+returns something this build has never seen degrades to `policy: null`, and the tool layer then falls
+back to the interactive wording — the only case the plugin can actually prove. It never invents a claim
+about who decided.
+
+Why it matters enough to carry a second paragraph of text into the result: the false version tells the
+model to wait for a user who has already answered, and to report to that user that they rejected
+something they were never shown. The true version names the actual unblocking move — a
+permission-preset switch — which is the user's to make. The preset that most often produces this is the
+shipped `danger-full-access`, which bundles `sandbox: danger-full-access` with `approval: never`; a
+profile that wants both full file access and prompts needs its own entry pairing `sandbox:
+danger-full-access` with `approval: ask`.
+
 The plugin does **not** police the model's retries: it makes the refusal legible and tells the model
 what to do instead. Recording a refused action and silently skipping the prompt on an identical retry
 would end the popup loop mechanically, but it can also block a user who has since changed their mind,

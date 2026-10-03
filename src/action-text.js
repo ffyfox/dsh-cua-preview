@@ -211,6 +211,17 @@ export function describeAction({ action, selector, value, url, target = null, la
  * shipped path distinguishes them too — and because "the user said no" is simply false for
  * `unavailable` (no approval channel was mounted). Language follows the same rule as the approval
  * sentence: only `zh*` selects Chinese, everything else is English.
+ *
+ * **`rejected` has two sources, and only one of them involves a human.** Under the `ask` policy it
+ * means an answerer said no. Under the `never` policy `ApprovalService.decide()` returns `rejected`
+ * *before* the `approval/request` waterfall, so no answerer ever sees the request and the user is
+ * never asked (`docs/subsystems/approval.md`: "`never` deterministically returns `rejected` without
+ * dispatching any answerer"). Telling the model "the user rejected it" in that case is a false
+ * attribution, and a costly one: the model is told to stop and ask a user who has already answered
+ * — by turning prompts off. The distinction comes from `ctx.approval.effectivePolicy(session)`, the
+ * documented read (same doc line: "Consumers read it with `ctx.approval.effectivePolicy(session)`"),
+ * and it is passed in as `promptsDisabled`. When it is absent — an older or unknown Host — the
+ * wording stays the interactive one, because that is the only case the plugin can prove.
  */
 
 /** The non-granting outcomes, each with distinct wording. */
@@ -254,16 +265,63 @@ const REFUSAL_LINES = {
 }
 
 /**
+ * Why no decision was taken, per outcome, when the session policy is `never`.
+ *
+ * Only `rejected` is reachable through the policy itself; `cancelled` is what an already-aborted
+ * call gets (the service checks the signal before the policy), and `unavailable` remains possible
+ * from a missing channel. All three are stated without attributing anything to a human.
+ */
+const PROMPTS_OFF_CAUSE = {
+  en: {
+    rejected: 'this session\'s approval policy is "never", so DSH rejected it automatically, before any answerer could be asked',
+    cancelled: 'the call was aborted before any approval decision could be taken',
+    unavailable: 'no approval channel is available',
+  },
+  zh: {
+    rejected: '本次会话的审批策略是 "never"，DSH 在任何应答者被询问之前就自动拒绝了它',
+    cancelled: '这次调用在任何审批决定作出之前就被中止了',
+    unavailable: '没有可用的审批通道',
+  },
+}
+
+/**
+ * The notice for a refusal produced by the `never` policy rather than by a person.
+ *
+ * The shipped sentence for this situation is not "the user rejected tool X" — it is the deterministic
+ * policy sentence DSH itself puts in the model's runtime context, quoted verbatim here so the model
+ * can connect the two. The next step is different from an interactive refusal as well: there is no
+ * decision to wait for, so the unblocking action is named — `/permission`, and a preset whose
+ * approval policy is `ask`.
+ */
+const PROMPTS_OFF_LINES = {
+  en: (toolName, decision) => [
+    `${toolName} was NOT performed: ${PROMPTS_OFF_CAUSE.en[decision] ?? PROMPTS_OFF_CAUSE.en.unavailable}.`,
+    `the user did NOT reject tool "${toolName}" — under the "never" policy no approval prompt exists and no answerer is asked, so no human took this decision. Nothing ran and the page is unchanged.`,
+    'DSH states the session\'s policy to the model as: "Approval prompts are disabled in this session: actions that require approval are rejected automatically."',
+    'Do not retry this action or an equivalent one. Tell the user what was refused, and ask them to run /permission and switch to a preset whose approval policy is "ask" — a preset can keep full file access and still ask (the shipped "danger-full-access" preset pairs full file access with no prompts, which is what disables this).',
+  ],
+  zh: (toolName, decision) => [
+    `${toolName} 未执行：${PROMPTS_OFF_CAUSE.zh[decision] ?? PROMPTS_OFF_CAUSE.zh.unavailable}。`,
+    `这不是用户拒绝了 tool "${toolName}"——在 "never" 策略下不存在审批弹窗、也不会询问任何应答者，因此没有任何人做过这个决定。操作没有执行，页面保持原样。`,
+    'DSH 把本次会话的策略这样告诉模型："Approval prompts are disabled in this session: actions that require approval are rejected automatically."',
+    '不要重试这个动作或等价动作。请告诉用户被拒绝的是什么，并请他们用 /permission 切换到一个审批策略为 "ask" 的预设——预设可以既保留完整文件权限、又保留询问（官方 "danger-full-access" 预设把完整文件权限和"不询问"绑在了一起，正是它关掉了询问）。',
+  ],
+}
+
+/**
  * The notice prepended to a non-granted tool result.
  *
  * @param {object} input - the refusal.
  * @param {string} input.toolName - the tool that was not allowed to act.
  * @param {string} input.decision - the `ApprovalOutcome` that came back.
  * @param {'en'|'zh'} [input.language] - notice language; defaults to English.
+ * @param {boolean} [input.promptsDisabled] - whether the session's policy was `never`, i.e. nobody
+ *   was asked. Defaults to false, which keeps the interactive wording.
  * @returns {string} the notice, as the lines the model reads (newline separated).
  */
-export function refusalNotice({ toolName, decision, language = 'en' }) {
-  const entry = REFUSAL_LINES[decision] ?? REFUSAL_LINES.unavailable
+export function refusalNotice({ toolName, decision, language = 'en', promptsDisabled = false }) {
   const lang = language === 'zh' ? 'zh' : 'en'
+  if (promptsDisabled === true) return PROMPTS_OFF_LINES[lang](toolName, decision).join('\n')
+  const entry = REFUSAL_LINES[decision] ?? REFUSAL_LINES.unavailable
   return entry[lang](toolName).join('\n')
 }

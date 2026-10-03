@@ -104,6 +104,17 @@ the user rejected tool "browser_act" —— 这是人的决定，不是调用失
 
 三种「未获批准」的结果措辞各不相同，模型因此能区分「人说了不」与「根本没有审批通道」：`rejected` 与 `cancelled` 被描述为用户的决定，而 `unavailable` 明确说明这**不是**用户的决定。同一条规则也写进了两个受把关工具的 `description`，所以它在模型动手**之前**就已进入系统提示，而不只是事后才出现。
 
+**`rejected` 有两种来源，其中只有一种牵涉到人。** 在 `ask` 策略下它是「应答者说了不」；而在 `never` 策略下——官方 `danger-full-access` 预设选的就是它，因为那个预设把「完整文件权限」和「不弹审批窗」绑在了一起——DSH 的 `ApprovalService.decide()` 会在 `approval/request` 瀑布**之前**就返回 `rejected`，因此根本不存在弹窗，也没有任何人被询问。此时告诉模型「用户拒绝了」是**错误归因**，而且代价很高：它会打发模型去等待一个早已用「关掉询问」回答过的用户。所以插件会读 `ctx.approval.effectivePolicy(session)`（文档写明的公开读法），把这种拒绝另写一套措辞——决定它的是会话策略而不是人，解法是 `/permission`。
+
+```text
+browser_act 未执行：本次会话的审批策略是 "never"，DSH 在任何应答者被询问之前就自动拒绝了它。
+这不是用户拒绝了 tool "browser_act"——在 "never" 策略下不存在审批弹窗、也不会询问任何应答者，因此没有任何人做过这个决定。操作没有执行，页面保持原样。
+DSH 把本次会话的策略这样告诉模型："Approval prompts are disabled in this session: actions that require approval are rejected automatically."
+不要重试这个动作或等价动作。请告诉用户被拒绝的是什么，并请他们用 /permission 切换到一个审批策略为 "ask" 的预设——预设可以既保留完整文件权限、又保留询问（官方 "danger-full-access" 预设把完整文件权限和"不询问"绑在了一起，正是它关掉了询问）。
+```
+
+读不到策略时会退回「交互式拒绝」那套措辞，因为那是插件唯一能证明的情况；它绝不会凭空编造「是谁做的决定」。
+
 重复弹窗**不做**抑制：插件不去管模型的重复尝试，用户改变主意后仍然可以批准后一次。机械地抑制完全相同的重复请求固然能结束弹窗循环，但它也可能挡住一个已经改口说「继续」的用户，而且一次工具执行并不携带可用于把抑制限定在单个模型轮次内的轮次标识。
 
 ## 测试
@@ -119,11 +130,11 @@ npm test
 
 | 入口 | 层次 | 依赖 | 检查项 |
 |---|---|---|---|
-| `npm run test:client` | Client 那一半，独立验证 | 仅需 Node | 79 |
-| `npm run test:acceptance` | Host 那一半，对接真实 DSH 服务 | Chrome | 107 |
-| `npm run test:real-load` | 两半一起，跑在真实的 `dsh` 进程内 | PATH 上有 `dsh` + Chrome | 18 |
+| `npm run test:client` | Client 那一半，独立验证 | 仅需 Node | 97 |
+| `npm run test:acceptance` | Host 那一半，对接真实 DSH 服务 | Chrome | 169 |
+| `npm run test:real-load` | 两半一起，跑在真实的 `dsh` 进程内 | PATH 上有 `dsh` + Chrome | 24 |
 
-合计 **204 项检查，0 失败**——三个入口都需要先 `npm install`。最后一个入口会启动官方 `dsh` 二进制，把插件以 patch 方式挂进去，监听由操作系统分配的随机空闲端口（因此绝不会与你正在运行的任何 profile 冲突），并在该进程内运行一个探针插件，读取实时的各项注册表。如果 PATH 上没有 `dsh`，它会明确报告并以非零码退出。它会把该次启动的审批策略固定为 `ask`，这样默认预设为 `danger-full-access` 的 profile 就不会把这次运行变成对预设的判断，而不是对插件的判断。
+合计 **290 项检查，0 失败**——三个入口都需要先 `npm install`。最后一个入口会启动官方 `dsh` 二进制，把插件以 patch 方式挂进去，监听由操作系统分配的随机空闲端口（因此绝不会与你正在运行的任何 profile 冲突），并在该进程内运行一个探针插件，读取实时的各项注册表。如果 PATH 上没有 `dsh`，它会明确报告并以非零码退出。它会把该次启动的审批策略固定为 `ask`，这样默认预设为 `danger-full-access` 的 profile 就不会把这次运行变成对预设的判断，而不是对插件的判断。
 
 CI 在每次 push 时运行 Client bundle 验证与打包检查，因为这两项无需浏览器即可复现。浏览器相关的套件不在该门禁内——它们需要 Chrome，最后一个还需要 `dsh` CLI——因此改为手动触发的任务。
 

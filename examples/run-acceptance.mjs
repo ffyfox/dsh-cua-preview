@@ -1079,6 +1079,27 @@ console.log('\n=== Fail-closed behaviour: the refusal reaches the model ===\n')
     }))).size === 3,
     'rejected / cancelled / unavailable must not read the same')
 
+  // The `never` policy produces the SAME outcome value (`rejected`) as a human declining, so the
+  // wording has to come from the policy fact instead. These pin that the model can tell the two
+  // apart, and is not sent off to wait for a decision that will never be made.
+  for (const language of ['en', 'zh']) {
+    const off = ['rejected', 'cancelled', 'unavailable'].map((decision) => refusalNotice({
+      toolName: 'browser_act', decision, language, promptsDisabled: true,
+    }))
+
+    check(`a ${language} policy-off notice does not claim the user rejected anything`,
+      off.every((notice) => !notice.includes('the user rejected tool "browser_act"') &&
+        !notice.includes('用户在审批中拒绝了')),
+      JSON.stringify(off[0]))
+    check(`a ${language} policy-off notice says the session policy rejected it, and that nobody decided`,
+      off.every((notice) => notice.includes('never') &&
+        notice.includes(language === 'zh' ? '没有任何人做过这个决定' : 'no human took this decision')),
+      JSON.stringify(off[0]))
+    check(`a ${language} policy-off notice names /permission and an "ask" preset as the way out`,
+      off.every((notice) => notice.includes('/permission') && notice.includes('"ask"')),
+      JSON.stringify(off[0]))
+  }
+
   // (3) End to end through the pipeline, with the real service: a rejection dispatched like the
   // agent loop dispatches it. `ctx.tools.execute` is the documented entry that runs the full
   // pipeline — `tools/pre-execute` → dispatch → `tools/post-execute` → the lossless materialization
@@ -1122,6 +1143,82 @@ console.log('\n=== Fail-closed behaviour: the refusal reaches the model ===\n')
   check('a refused dispatch performs no action',
     mainBefore.url === mainAfter.url && mainBefore.text === mainAfter.text,
     'page unchanged')
+}
+
+// ---------------------------------------------------------------------------------------------
+// A session whose approval policy is `never`: the ask never reaches an answerer, so the refusal must
+// say that instead of blaming the user.
+// ---------------------------------------------------------------------------------------------
+//
+// This is what the operator's own profiles do — `defaultPreset: danger-full-access` maps to
+// `approval: never` — and it is why every gated action is refused there. `ApprovalService.decide()`
+// returns `rejected` BEFORE the `approval/request` waterfall (`docs/subsystems/approval.md`: "`never`
+// deterministically returns `rejected` without dispatching any answerer"), so there is no prompt to
+// "fail to appear". The policy is switched here through `setApprovalPolicy`, the documented single
+// write path (it appends the `approval/policy` event `effectivePolicy` folds), which is exactly what
+// a preset switch does. The answerer mounted above would GRANT, so "it was never consulted" is
+// decisive rather than coincidental.
+
+console.log('\n--- the never policy: nobody is asked, and the refusal says so ---\n')
+
+{
+  const { setApprovalPolicy } = await import('@deepseek-ai/dsh-user-approval')
+  const { validateJsonSchemaValue } = await import('@deepseek-ai/dsh-tools')
+
+  await page.setContent('<!doctype html><html><body><button id="click-target">Go</button></body></html>')
+  const callsBefore = answererCalls
+  const grantsBefore = await page.$eval('#click-target', (el) => el.textContent)
+
+  setApprovalPolicy(session, 'never')
+  auditSeen()
+  const offResult = await tool.execute(
+    { action: 'click', selector: '#click-target' },
+    { ...execBase, callId: brandString('call-cua-acceptance-prompts-off') },
+  )
+  auditSeen()
+  const offFact = cuaPreview.broker.decisions.at(-1)
+
+  check('under the never policy the mounted answerer is NOT consulted',
+    answererCalls === callsBefore, `answerer calls ${callsBefore} -> ${answererCalls}`)
+  check('the audit pair is still written and the outcome is rejected',
+    askedEvents.length === 1 && decidedEvents.length === 1 &&
+      decidedEvents[0]?.data?.outcome === 'rejected',
+    `asked=${askedEvents.length} decided=${decidedEvents.length} outcome=${String(decidedEvents[0]?.data?.outcome)}`)
+  check('the broker records the policy that decided the ask',
+    offFact?.policy === 'never', `policy=${String(offFact?.policy)}`)
+  check('the refusal marks the prompts as off rather than blaming the user',
+    offResult.granted === false && offResult.promptsDisabled === true,
+    `granted=${String(offResult.granted)} promptsDisabled=${String(offResult.promptsDisabled)}`)
+  check('the refused action really did not run',
+    (await page.$eval('#click-target', (el) => el.textContent)) === grantsBefore,
+    'the page is unchanged')
+  {
+    const text = tool.output.render({ action: 'click', selector: '#click-target' }, offResult)
+      .find((block) => block.type === 'text').text
+    check('the refusal the model reads says the policy rejected it and nobody decided',
+      text.includes('never') && text.includes('no human took this decision') &&
+        !text.includes('the user rejected tool'),
+      JSON.stringify(text))
+    check('the refusal names /permission as the way to unblock it',
+      text.includes('/permission'), JSON.stringify(text))
+    check('the policy-off refusal satisfies the declared output schema',
+      validateJsonSchemaValue(tool.output.schema, offResult, 'value').length === 0,
+      JSON.stringify(validateJsonSchemaValue(tool.output.schema, offResult, 'value')))
+  }
+
+  // Restoring matters for the sections that follow as much as for the assertion: a session left on
+  // `never` would make every later gated action refuse.
+  setApprovalPolicy(session, 'ask')
+  auditSeen()
+  const restored = await tool.execute(
+    { action: 'click', selector: '#click-target' },
+    { ...execBase, callId: brandString('call-cua-acceptance-policy-restored') },
+  )
+  auditSeen()
+  check('switching the policy back to "ask" restores the interactive path',
+    restored.granted === true && restored.decision === 'allowed-once' &&
+      restored.promptsDisabled === undefined,
+    `decision=${String(restored.decision)} promptsDisabled=${String(restored.promptsDisabled)}`)
 }
 
 // ---------------------------------------------------------------------------------------------

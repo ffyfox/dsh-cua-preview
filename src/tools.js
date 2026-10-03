@@ -268,9 +268,13 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
     description:
       'Open a URL in the plugin browser and return the resulting page title and URL. ' +
       'Navigation is an approval-gated action: the user is asked before the page is opened. ' +
-      'If the result says the user rejected (or cancelled) the request, the navigation did not ' +
-      'happen: that is a decision by the user, not a failure — do not retry the same navigation, ' +
-      'stop and ask the user what to change or what to do next. ' +
+      'If the result says the request was rejected or cancelled, the navigation did not ' +
+      'happen and that is not a failure of the call — do not retry the same navigation, stop and ' +
+      'ask the user what to change or what to do next. Which it was matters: a result that says the ' +
+      'USER rejected it is a human decision, while one that says the session\'s approval policy ' +
+      'rejected it automatically means nobody was asked at all (the user has turned approval ' +
+      'prompts off), so do not tell the user they rejected it and do not expect a retry to help — ' +
+      'the unblocking move is theirs, a permission-preset switch. ' +
       'The returned screenshot shows the page AFTER navigation, so it is the result: the plugin ' +
       'waits for the page to stop changing — its network quiet, its DOM stable — before capturing, ' +
       'bounded by the configured settle budget (3 s by default). If the result reports ' +
@@ -300,6 +304,9 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
           settled: { type: 'boolean' },
           settleMs: { type: 'integer' },
           networkBusy: { type: 'boolean' },
+          // Present only on a refusal the SESSION POLICY produced (nobody was asked), so the notice
+          // cannot attribute a policy decision to the user.
+          promptsDisabled: { type: 'boolean' },
         },
       },
       render: (args, value) => {
@@ -322,11 +329,13 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
                 ...settleNote(value),
               ].join('\n')
             : [
-                // The notice leads, so the first thing the model reads is that a human said no.
+                // The notice leads, so the first thing the model reads is why nothing ran — and whether
+                // a human was involved at all.
                 refusalNotice({
                   toolName: 'browser_navigate',
                   decision: value.decision,
                   language: approvalLanguageOf(ctx),
+                  promptsDisabled: value.promptsDisabled === true,
                 }),
                 '',
                 // Dropped, never guessed: `value.url` is the page the browser is still on, and
@@ -458,9 +467,13 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
     description:
       'Perform a side-effecting action on the plugin browser page. The user is asked to approve ' +
       'the action first. Fails closed: anything other than an explicit one-shot approval performs ' +
-      'no action. If the result says the user rejected (or cancelled) the request, nothing ran and ' +
-      'that is a decision by the user, not a failure — do not retry the same action or an ' +
-      'equivalent one, stop and ask the user what to change or what to do next. ' +
+      'no action. If the result says the request was rejected or cancelled, nothing ran and ' +
+      'that is not a failure of the call — do not retry the same action or an ' +
+      'equivalent one, stop and ask the user what to change or what to do next. Which it was ' +
+      'matters: a result that says the USER rejected it is a human decision, while one that says ' +
+      'the session\'s approval policy rejected it automatically means nobody was asked at all (the ' +
+      'user has turned approval prompts off), so do not tell the user they rejected it and do not ' +
+      'expect a retry to help — the unblocking move is theirs, a permission-preset switch. ' +
       'Actions: `click` (activate a control), `fill` (replace a field\'s contents; it ' +
       'clears the field first rather than appending), `submit` (submit a form). ' +
       'This result carries up to two images, in this order: the screen the user was shown when ' +
@@ -508,6 +521,9 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
           settled: { type: 'boolean' },
           settleMs: { type: 'integer' },
           networkBusy: { type: 'boolean' },
+          // Present only on a refusal the SESSION POLICY produced (nobody was asked), so the notice
+          // cannot attribute a policy decision to the user.
+          promptsDisabled: { type: 'boolean' },
         },
       },
       render: (_args, value) => imageContent(
@@ -524,11 +540,13 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
               ...settleNote(value),
             ].join('\n')
           : [
-              // The notice leads, so the first thing the model reads is that a human said no.
+              // The notice leads, so the first thing the model reads is why nothing ran — and whether
+              // a human was involved at all.
               refusalNotice({
                 toolName: 'browser_act',
                 decision: value.decision,
                 language: approvalLanguageOf(ctx),
+                promptsDisabled: value.promptsDisabled === true,
               }),
               '',
               `request: ${value.action} ${value.selector}`,
@@ -584,6 +602,8 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
             selector: args.selector,
             granted: false,
             decision: outcome.decision,
+            // `rejected` under the `never` policy means nobody was asked, which the notice must say.
+            ...(outcome.policy === 'never' ? { promptsDisabled: true } : {}),
             url: state.url,
             screenshotPath: outcome.screenshot?.path ?? '',
             ...(before === null ? {} : { image: before }),
@@ -748,6 +768,9 @@ async function refusedNavigate(ctx, browser, outcome, logger) {
     title: state.title,
     granted: false,
     decision: outcome.decision,
+    // `rejected` under the `never` policy means nobody was asked; the notice renders that fact
+    // instead of attributing a policy decision to the user.
+    ...(outcome.policy === 'never' ? { promptsDisabled: true } : {}),
     // No navigation happened, so there is no post-action frame; the approval-time frame is the
     // honest state to report. It may legitimately be absent (blank screen, capture failure),
     // which is why the schema declares both image fields optional.

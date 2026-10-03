@@ -76,6 +76,17 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   line in the model-facing text when the budget ran out. A heuristic cannot promise a frame is final, so
   the result says so instead of the plugin claiming more than it verified; with `settle: false` the
   fields are absent entirely.
+- `examples/test-page/slow.html`, a fixture whose banner changes colour 900 ms after load and 900 ms
+  after a click. 39 new acceptance checks use it and the workspace: 24 compare the tool's frame against
+  two references taken from the same browser — what a no-wait capture shows, and what the settled page
+  shows — and require the tool's frame to be the second and not the first; one of those drives a page
+  that never answers, to pin the bounded-and-reported `settled: false` path; seven pin the new `settle`
+  configuration surface (default, disable switch, number shorthand, partial object, and the refusal of
+  everything else); and the rest pin the policy-off refusal against the real `ApprovalService`, where the
+  mounted answerer would have granted and is proven not to be consulted.
+- `promptsDisabled` on a refused `browser_navigate` / `browser_act` result, present exactly when the
+  session policy meant nobody was asked, so a Client or a reader can tell the two refusals apart without
+  parsing the prose.
 
 ### Fixed
 
@@ -110,6 +121,18 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   single frame the way the build that wrote it did. Nothing the plugin shows is carried by a session event
   of its own any more: while the approval is open the row paints the live screen (see Added), and once the
   call returns it paints the frames from the call's own result.
+- **A refusal produced by the session's `never` approval policy is no longer reported as "the user
+  rejected it".** `rejected` is the outcome both for a human declining (under `ask`) and for the policy
+  refusing before any answerer is consulted (under `never`, which is what the shipped
+  `danger-full-access` preset selects). One value covered two different facts, and the plugin told the
+  model the wrong one — sending it to wait for a user who had already answered, by turning prompts off.
+  The broker now reads `ctx.approval.effectivePolicy(session)` before raising the request, records it as
+  `policy`, and a refusal carries `promptsDisabled: true` when nobody was asked; the notice then says the
+  session policy rejected it, that no human decided, and that the way to unblock it is `/permission`
+  with an `ask` preset. An unreadable policy degrades to the interactive wording, so nothing about who
+  decided is ever invented. The gated tools' descriptions now state the same distinction, and the
+  acceptance harness proves the short-circuit with the policy switched through `setApprovalPolicy` — the
+  answerer mounted in that run would have GRANTED, and it is not consulted at all.
 - **Adapted to DSH `0.2.0-rc.2`.** The development dependencies now track that release train
   (`@deepseek-ai/dsh-*` `0.2.0-rc.2`, `@deepseek-ai/cordis` `4.0.4`, `@deepseek-ai/cordis-plugin-loader`
   `1.0.5`, `@deepseek-ai/schemastery` `3.18.4`), and the obsolete `@deepseek-ai/dsh-code-runtime` dev

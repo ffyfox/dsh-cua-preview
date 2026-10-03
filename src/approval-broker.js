@@ -143,10 +143,20 @@ export class CuaApprovalBroker {
         decision: 'unavailable',
         granted: false,
         reason: 'no approval service is mounted; failing closed',
+        policy: null,
       }
       this.decisions.push(failure)
       return failure
     }
+
+    // Which policy governed this ask is a fact OF the decision, not decoration. Under `never` the
+    // service returns `rejected` before dispatching any answerer, so the same outcome means "a human
+    // said no" under `ask` and "nobody was asked" under `never` — and the tool layer must not tell
+    // the model the first when the second happened. Read through the documented accessor
+    // (`docs/subsystems/approval.md`: "Consumers read it with `ctx.approval.effectivePolicy(session)`"),
+    // BEFORE the request: what matters is the policy the service decided under, and reading it after
+    // a user switched presets mid-ask would describe the wrong decision.
+    const policy = this.#policyOf(approval, agent)
 
     // ---- Is there a screen worth showing? --------------------------------------------------
     // The credential frame answers "what does the screen look like right now". Before the first
@@ -216,6 +226,7 @@ export class CuaApprovalBroker {
         decision: 'unavailable',
         granted: false,
         reason: `approval.request threw: ${error instanceof Error ? error.message : String(error)}`,
+        policy,
         screenshot,
         frameOmitted: blankScreen ? 'blank-screen' : null,
       }
@@ -231,6 +242,7 @@ export class CuaApprovalBroker {
       decision,
       granted: decision === GRANTING_OUTCOME,
       reason,
+      policy,
       screenshot,
       captureError: captureError === null ? null : String(captureError),
       // Why no credential frame exists, when none does: the current screen was an unloaded empty
@@ -239,6 +251,26 @@ export class CuaApprovalBroker {
     }
     this.decisions.push(result)
     return result
+  }
+
+  /**
+   * The approval policy in effect for one ask, or null when it cannot be read.
+   *
+   * Only the two documented vocabulary values are accepted. A Host that renames or removes the
+   * accessor, or returns something this build has never seen, degrades to "unknown" — which makes the
+   * tool layer fall back to the interactive wording rather than invent a claim about who decided.
+   *
+   * @param {object} approval - the mounted approval service.
+   * @param {object} agent - the asking agent, whose session carries any override.
+   * @returns {'ask'|'never'|null} the effective policy.
+   */
+  #policyOf(approval, agent) {
+    try {
+      const policy = approval.effectivePolicy?.(agent?.session)
+      return policy === 'ask' || policy === 'never' ? policy : null
+    } catch {
+      return null
+    }
   }
 
   // A frame reaches the Client through the `tool/result` of its own call (see the class comment):
