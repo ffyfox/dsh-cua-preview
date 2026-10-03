@@ -5,6 +5,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-03
+
 ### Fixed
 
 - **The `after the action` frame stayed below the fold after an approval.** Each frame's box is now
