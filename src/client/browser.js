@@ -13,6 +13,20 @@
  *    `loadImage` loader it receives in its owner props. That is the "own a distinct slot" route the
  *    slot contract names.
  *
+ *    **The row paints two different things, at two different stages.**
+ *
+ *    **While the call is running** — which is exactly while its approval is still pending — the row
+ *    paints the screen as it is *right now*, so the person answering the approval can see what they
+ *    are approving. At that moment nothing has been logged: the call has produced no result, and the
+ *    client-side image loader only resolves references that a known event carries. So these bytes do
+ *    not come from an event at all. The Host holds the frame it captured an instant before asking
+ *    (`pending-frames.js`) and serves it on the exact Fetch route the Connection documents for a
+ *    browser-native response (`docs/api-gateway.md`: "A feature that needs a streamed or
+ *    browser-native response registers an exact Connection Fetch route instead of defining a Remote
+ *    method"). This bundle reads it through a Client resource — `dsh-resource://cua/frame/<callId>` —
+ *    which is the one seat that hands a component a live value synchronously; the provider asks the
+ *    route again until the frame is there, because the row mounts *before* the Host captures it.
+ *
  *    **Once the call has settled**, the row paints the frames of the gated action in the order they
  *    happened: the frame the user was shown when they approved ("before the action") first, the frame
  *    after the action below it, so the row reads as a timeline. Both are references inside the call's
@@ -96,6 +110,36 @@ window.__ModuleLoader__.load({
 		/** The caption a refusal's single frame carries: nothing ran, so it IS the approval-time state. */
 		const REFUSAL_CAPTION = "at approval time (no action ran)";
 
+		/**
+		 * The caption on the live frame the row paints while an approval is still pending.
+		 *
+		 * It has to say what the picture *is*, because it is not a frame of the action: it is the
+		 * screen at the moment the question is being asked. "current screen" is the honest name for
+		 * that, and the parenthetical says why it is on screen at all.
+		 */
+		const PENDING_CAPTION = "current screen (approval pending)";
+
+		/** The Client resource protocol that carries the pending frame of one tool call. */
+		const FRAME_PROTOCOL = "cua";
+
+		/** The exact Fetch route the Host registers for those frames. */
+		const FRAME_ROUTE = "/api/cua-preview.frame";
+
+		/** The query parameter naming the tool call whose frame is wanted. */
+		const FRAME_CALL_ID = "callId";
+
+		/** The tool keys that raise an approval, so only they can ever have a pending frame. */
+		const GATED_KEYS = ["browser_act", "browser_navigate"];
+
+		/** How long the provider keeps asking for one call before it gives up. */
+		const FRAME_DEADLINE_MS = 10_000;
+
+		/** Backoff between asks: the first wait, doubling up to {@link FRAME_MAX_WAIT_MS}. */
+		const FRAME_FIRST_WAIT_MS = 100;
+
+		/** The backoff ceiling, so a slow capture does not turn into a request storm. */
+		const FRAME_MAX_WAIT_MS = 500;
+
 		/** Inline styles: no CSS injection, so there is no stylesheet tag to own or clean up. */
 		const S = {
 			card: {
@@ -154,6 +198,12 @@ window.__ModuleLoader__.load({
 				border: "0.5px dashed var(--dsw-alias-border-l2)",
 				borderRadius: "12px",
 				padding: "10px 12px"
+			},
+			pending: {
+				display: "flex",
+				flexDirection: "column",
+				gap: "6px",
+				minWidth: 0
 			}
 		};
 
@@ -349,22 +399,192 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * The Client resource address carrying the pending frame of one tool call.
+		 *
+		 * The protocol host is this plugin's own, so the address cannot collide with a shipped one,
+		 * and the call id is the path segment because that is the one identity the row and the Host
+		 * both already have.
+		 *
+		 * @param callId - the tool call identity.
+		 * @returns the address.
+		 */
+		function frameAddress(callId) {
+			return `dsh-resource://${FRAME_PROTOCOL}/frame/${encodeURIComponent(callId)}`;
+		}
+
+		/**
+		 * The call id inside a frame address, or null when the address is not one of ours.
+		 *
+		 * Validated rather than trusted: a resource address is a string, and a malformed one must
+		 * produce no request at all instead of a request for the wrong thing.
+		 *
+		 * @param address - the address the resource service was asked to open.
+		 * @returns the call id, or null.
+		 */
+		function callIdOfFrameAddress(address) {
+			if (typeof address !== "string") return null;
+			const prefix = `dsh-resource://${FRAME_PROTOCOL}/frame/`;
+			if (address.startsWith(prefix) !== true) return null;
+			try {
+				return decodeURIComponent(address.slice(prefix.length));
+			} catch {
+				return null;
+			}
+		}
+
+		/**
+		 * Wait, but wake up at once when the resource is released.
+		 *
+		 * The sleep is what spaces the retries; it must never outlive the subscription, so an abort
+		 * resolves it immediately instead of leaving a timer behind.
+		 *
+		 * @param ms - how long to wait.
+		 * @param signal - the resource subscription's signal.
+		 * @returns a promise that settles when the wait ends or the signal aborts.
+		 */
+		function pause(ms, signal) {
+			return new Promise((resolve) => {
+				if (signal?.aborted === true) {
+					resolve();
+					return;
+				}
+				const finish = () => {
+					clearTimeout(timer);
+					signal?.removeEventListener?.("abort", finish);
+					resolve();
+				};
+				const timer = setTimeout(finish, ms);
+				signal?.addEventListener?.("abort", finish);
+			});
+		}
+
+		/**
+		 * The provider for `dsh-resource://cua/frame/<callId>`.
+		 *
+		 * **Why it asks more than once.** The row is mounted when the tool call is dispatched, and the
+		 * Host captures the frame a moment later, just before it raises the approval. So the first
+		 * answer is normally "nothing yet" — a 404 — and the frame appears on a later ask. The retries
+		 * are bounded twice over: by a deadline, and by the subscription itself, which ends the moment
+		 * the row stops painting the running stage.
+		 *
+		 * **Why 404 keeps the loop and no other status does.** 404 is the Host saying "no frame is
+		 * pending for this call", which is exactly the not-yet case (and stays true for a blank screen
+		 * or a failed capture, where no frame will ever exist — the deadline ends those). Any other
+		 * failure is a different fact about a different thing, and asking again cannot change it.
+		 *
+		 * **Why the value is an object URL.** The bytes arrive as an image response, and an object URL
+		 * is what the shipped image path itself builds out of fetched bytes
+		 * (`dsh-client-ui-conversation`: `URL.createObjectURL(new Blob([bytes]))`). The component that
+		 * renders it revokes it.
+		 *
+		 * @returns the resource provider to register.
+		 */
+		function pendingFrameProvider() {
+			return {
+				protocol: FRAME_PROTOCOL,
+				async *open(address, context) {
+					const signal = context?.signal;
+					const callId = callIdOfFrameAddress(address);
+					if (callId === null || callId === "") return;
+					const startedAt = Date.now();
+					let wait = FRAME_FIRST_WAIT_MS;
+					for (;;) {
+						if (signal?.aborted === true) return;
+						let response;
+						try {
+							response = await fetch(`${FRAME_ROUTE}?${FRAME_CALL_ID}=${encodeURIComponent(callId)}`, {
+								signal,
+								cache: "no-store"
+							});
+						} catch {
+							// Released, or the Host is unreachable: there is nothing to paint and nothing
+							// a retry could reach.
+							return;
+						}
+						if (response.ok === true) {
+							let url = null;
+							try {
+								const blob = await response.blob();
+								if (typeof URL?.createObjectURL === "function") url = URL.createObjectURL(blob);
+							} catch {
+								url = null;
+							}
+							if (url === null) return;
+							yield { ok: true, value: { url } };
+							return;
+						}
+						if (response.status !== 404) return;
+						if (Date.now() - startedAt >= FRAME_DEADLINE_MS) return;
+						await pause(wait, signal);
+						wait = Math.min(wait * 2, FRAME_MAX_WAIT_MS);
+					}
+				}
+			};
+		}
+
+		/**
+		 * The live screen of an approval that has not been answered yet.
+		 *
+		 * The value is read synchronously from the resource seat (`useResource`), which is why this is
+		 * a component of its own rather than an effect inside the row: a hook must run on every render
+		 * of the component that owns it, and the row returns early for a block it cannot read.
+		 *
+		 * Nothing is painted until a frame actually exists. A placeholder would be a claim in the one
+		 * moment the operator is deciding, and "no frame" is a real answer here — a blank tab and a
+		 * failed capture produce none.
+		 *
+		 * @param props.callId - the tool call whose frame is wanted.
+		 * @param props.useResource - the standard resource hook supplied by the Client.
+		 */
+		function CuaPendingFrame({ callId, useResource }) {
+			const resource = useResource(frameAddress(callId));
+			const live = resource !== null && typeof resource === "object" && resource.status === "live";
+			const url = live && resource.value !== null && typeof resource.value === "object"
+				&& typeof resource.value.url === "string"
+				? resource.value.url
+				: null;
+
+			// The provider owns creating the URL and the component owns releasing it: nothing else
+			// holds a reference, so nothing else can know when this row is done with it.
+			react.useEffect(() => {
+				if (url === null) return undefined;
+				return () => {
+					if (typeof URL?.revokeObjectURL === "function") URL.revokeObjectURL(url);
+				};
+			}, [url]);
+
+			if (url === null) return null;
+			return jsxs("div", {
+				style: S.pending,
+				children: [
+					jsx("div", { style: S.caption, children: PENDING_CAPTION }, "pending-caption"),
+					jsx("img", { src: url, alt: "Current browser screen", style: S.image }, "pending-image")
+				]
+			}, "pending");
+		}
+
+		/**
 		 * The conversation row for browser_act / browser_navigate / browser_screenshot.
 		 *
-		 * Once the call has settled, the row paints the frames of that gated action in the order they
-		 * happened: the frame the user was shown when they approved first, then the frame after the
-		 * action, each under the caption `presentationMeta.frames` assigns it, both read through
-		 * `loadImage` because both are references in this call's own result content. See the file
-		 * header.
+		 * Two stages, two pictures. While the call is running — which is while its approval is still
+		 * pending — the row paints the live screen through {@link CuaPendingFrame}, so the decision is
+		 * made with the screen in front of it. Once the call has settled, it paints the frames of that
+		 * gated action in the order they happened: the frame the user was shown when they approved
+		 * first, then the frame after the action, each under the caption `presentationMeta.frames`
+		 * assigns it, both read through `loadImage` because both are references in this call's own
+		 * result content. See the file header for both routes.
 		 *
 		 * A refusal has no post-action state, so its single frame *is* the approval-time one and its
 		 * caption says so.
 		 *
 		 * @param props.phase - the lifecycle stage, when the host declares one (DSH >= 0.2.0-rc.2).
 		 * @param props.block - the frozen stage block: running call or settled result node.
+		 * @param props.callId - the tool call identity, when the host supplies one.
 		 * @param props.loadImage - session-authorized image loader.
+		 * @param props.useResource - the standard resource hook; absent on a host that does not mount
+		 *   the resource service, in which case only the settled frames are painted.
 		 */
-		function CuaRow({ phase, block, loadImage }) {
+		function CuaRow({ phase, block, callId, loadImage, useResource }) {
 			// A detached reader can hand back a null block for a log another build wrote. `in`
 			// on null throws, so this is checked before anything else touches the value.
 			if (block === null || typeof block !== "object") {
@@ -404,6 +624,13 @@ window.__ModuleLoader__.load({
 				)
 			];
 
+			// While the call is running, the approval is on screen, so the row shows what is being
+			// approved. Only the two gated tools can ever have such a frame: the others never ask.
+			if (settled !== true && typeof callId === "string" && typeof useResource === "function"
+				&& GATED_KEYS.includes(name)) {
+				children.push(jsx(CuaPendingFrame, { callId, useResource }, "pending"));
+			}
+
 			for (let i = 0; i < texts.length; i += 1) {
 				children.push(jsx("div", { style: S.text, children: texts[i] }, `text-${i}`));
 			}
@@ -424,15 +651,27 @@ window.__ModuleLoader__.load({
 		/** Tool names this view owns. An unclaimed key falls back to the generic row. */
 		const TOOL_KEYS = ["browser_act", "browser_navigate", "browser_screenshot"];
 
-		/** The slot registry this plugin contributes rows to. */
-		const inject = ["slots"];
+		/**
+		 * The services this bundle consumes: the slot registry it contributes rows to, and the
+		 * resource service that carries the pending-approval frame.
+		 *
+		 * `resources` is a hard dependency here, unlike `connection` on the Host half. It is not an
+		 * optional facility: `dsh-client-resources` provides the `useResource` standard prop that every
+		 * slot component of the shipped Web Client receives, so a Client without it is not a
+		 * configuration this bundle has to survive — and the documented way to reach it is exactly this
+		 * inject list (`docs/subsystems/client-resources.md`).
+		 */
+		const inject = ["slots", "resources"];
 
 		/**
-		 * Claim one keyed Tool-call view per browser tool.
+		 * Claim one keyed Tool-call view per browser tool, and publish the pending-frame resource.
 		 *
 		 * The frames of a *settled* call arrive inside the call's own result, so the row needs no event
 		 * definition, no carrier node and no session hook for those; it renders them from its owner
-		 * props.
+		 * props. The *pending* frame is the one thing that cannot come from the log (nothing is logged
+		 * yet), so it is read from the Host's exact Fetch route through the provider registered here.
+		 * The registration lives inside `ctx.effect`, which is how the documented client-resource
+		 * example scopes a provider to its plugin.
 		 *
 		 * `conversation.approval.detail` is deliberately absent — the shipped `dsh-client-ui-chat`
 		 * owns that `single` slot at priority 0, and a second same-priority registration throws
@@ -442,6 +681,10 @@ window.__ModuleLoader__.load({
 		 * @param ctx - the Client plugin context.
 		 */
 		function apply(ctx) {
+			ctx.effect(
+				() => ctx.resources.register(pendingFrameProvider()),
+				"dsh-cua-preview: pending-approval frame resource"
+			);
 			for (const key of TOOL_KEYS) {
 				ctx.slots.inject("tool.call.toolview", () =>
 					ctx.slots.register({ name: "tool.call.toolview", key, locale: NS }, CuaRow)
@@ -454,6 +697,11 @@ window.__ModuleLoader__.load({
 		exports.TOOL_KEYS = TOOL_KEYS;
 		exports.FRAME_CAPTIONS = FRAME_CAPTIONS;
 		exports.REFUSAL_CAPTION = REFUSAL_CAPTION;
+		exports.PENDING_CAPTION = PENDING_CAPTION;
+		exports.FRAME_PROTOCOL = FRAME_PROTOCOL;
+		exports.FRAME_ROUTE = FRAME_ROUTE;
+		exports.GATED_KEYS = GATED_KEYS;
+		exports.frameAddress = frameAddress;
 		return module.exports;
 	}
 });

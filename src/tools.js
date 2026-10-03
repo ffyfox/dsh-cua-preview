@@ -240,19 +240,25 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
         callId: exec.callId,
         signal: exec.signal,
       })
-      if (!outcome.granted) return refusedNavigate(ctx, browser, outcome, logger)
-      const result = await browser.navigate(args.url, exec.signal)
-      const after = await captureResult(ctx, browser, broker, logger, 'navigate')
-      const before = await saveApprovalFrame(ctx, outcome, logger)
-      return {
-        url: result.url,
-        title: result.title,
-        granted: true,
-        decision: outcome.decision,
-        screenshotPath: after.path,
-        ...(outcome.screenshot?.path === undefined ? {} : { approvalScreenshotPath: outcome.screenshot.path }),
-        ...(after.attachment === null ? {} : { image: after.attachment }),
-        ...(before === null ? {} : { approvalImage: before }),
+      // The held approval-time frame is dropped once this call's own result exists: from that moment
+      // the result carries the same picture, and the live route should have nothing left to serve.
+      try {
+        if (!outcome.granted) return refusedNavigate(ctx, browser, outcome, logger)
+        const result = await browser.navigate(args.url, exec.signal)
+        const after = await captureResult(ctx, browser, broker, logger, 'navigate')
+        const before = await saveApprovalFrame(ctx, outcome, logger)
+        return {
+          url: result.url,
+          title: result.title,
+          granted: true,
+          decision: outcome.decision,
+          screenshotPath: after.path,
+          ...(outcome.screenshot?.path === undefined ? {} : { approvalScreenshotPath: outcome.screenshot.path }),
+          ...(after.attachment === null ? {} : { image: after.attachment }),
+          ...(before === null ? {} : { approvalImage: before }),
+        }
+      } finally {
+        broker.forgetPendingFrame(exec.callId)
       }
     },
   }))
@@ -435,37 +441,44 @@ export function registerBrowserTools(ctx, { browser, broker, logger }) {
 
       // Fail closed: only an explicit one-shot grant reaches the page. A refusal has no
       // post-action state to show, so it reports the approval-time frame instead.
-      if (!outcome.granted) {
+      //
+      // The `finally` drops the held approval-time frame once this call's own result exists: from
+      // that moment the result carries the same picture, so the live route should serve nothing.
+      try {
+        if (!outcome.granted) {
+          const state = await browser.snapshot()
+          const before = await saveApprovalFrame(ctx, outcome, logger)
+          return {
+            action: args.action,
+            selector: args.selector,
+            granted: false,
+            decision: outcome.decision,
+            url: state.url,
+            screenshotPath: outcome.screenshot?.path ?? '',
+            ...(before === null ? {} : { image: before }),
+          }
+        }
+
+        if (args.action === 'click') await browser.click(args.selector, exec.signal)
+        else if (args.action === 'fill') await browser.fill(args.selector, args.value, exec.signal)
+        else await browser.submit(args.selector, exec.signal)
+
         const state = await browser.snapshot()
+        const after = await captureResult(ctx, browser, broker, logger, args.action)
         const before = await saveApprovalFrame(ctx, outcome, logger)
         return {
           action: args.action,
           selector: args.selector,
-          granted: false,
+          granted: true,
           decision: outcome.decision,
           url: state.url,
-          screenshotPath: outcome.screenshot?.path ?? '',
-          ...(before === null ? {} : { image: before }),
+          screenshotPath: after.path,
+          ...(outcome.screenshot?.path === undefined ? {} : { approvalScreenshotPath: outcome.screenshot.path }),
+          ...(after.attachment === null ? {} : { image: after.attachment }),
+          ...(before === null ? {} : { approvalImage: before }),
         }
-      }
-
-      if (args.action === 'click') await browser.click(args.selector, exec.signal)
-      else if (args.action === 'fill') await browser.fill(args.selector, args.value, exec.signal)
-      else await browser.submit(args.selector, exec.signal)
-
-      const state = await browser.snapshot()
-      const after = await captureResult(ctx, browser, broker, logger, args.action)
-      const before = await saveApprovalFrame(ctx, outcome, logger)
-      return {
-        action: args.action,
-        selector: args.selector,
-        granted: true,
-        decision: outcome.decision,
-        url: state.url,
-        screenshotPath: after.path,
-        ...(outcome.screenshot?.path === undefined ? {} : { approvalScreenshotPath: outcome.screenshot.path }),
-        ...(after.attachment === null ? {} : { image: after.attachment }),
-        ...(before === null ? {} : { approvalImage: before }),
+      } finally {
+        broker.forgetPendingFrame(exec.callId)
       }
     },
   }))

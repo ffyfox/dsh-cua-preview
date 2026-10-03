@@ -92,8 +92,8 @@ try {
 check('the factory runs without throwing', true)
 check('it exports apply()', typeof exportsValue.apply === 'function')
 check('it exports an inject service list', Array.isArray(exportsValue.inject), JSON.stringify(exportsValue.inject))
-check('it injects the slot registry, and nothing else',
-  JSON.stringify(exportsValue.inject) === JSON.stringify(['slots']),
+check('it injects the slot registry and the resource service, and nothing else',
+  JSON.stringify(exportsValue.inject) === JSON.stringify(['slots', 'resources']),
   JSON.stringify(exportsValue.inject))
 
 // ---------------------------------------------------------------------------------------------
@@ -101,10 +101,24 @@ check('it injects the slot registry, and nothing else',
 // ---------------------------------------------------------------------------------------------
 
 const registered = []
+const providers = []
 
 // Deliberately no `uiConversation`: a bundle that reached for one would throw here, which is the
-// point. This plugin renders from its own slot props and publishes no Conversation node.
+// point. This plugin renders from its own slot props and publishes no Conversation node. The
+// resource registry is present because the pending-approval frame has no event to read it from.
 const ctxStub = {
+  effect: (callback) => {
+    const disposer = callback()
+    return () => {
+      if (typeof disposer === 'function') disposer()
+    }
+  },
+  resources: {
+    register: (provider) => {
+      providers.push(provider)
+      return () => {}
+    },
+  },
   slots: {
     inject: (_name, callback) => callback(),
     register: (config, component) => {
@@ -144,6 +158,8 @@ const SOURCE_FILES = [
   'src/browser.js',
   'src/approval-broker.js',
   'src/action-text.js',
+  'src/pending-frames.js',
+  'src/frame-route.js',
   'src/client/browser.js',
 ]
 const sources = Object.fromEntries(SOURCE_FILES.map((file) => [
@@ -197,6 +213,114 @@ check('no two registrations collide on (name, key, priority)',
   registered.map((r) => `${r.config.name}|${r.config.key ?? ''}`).join(', '))
 check('every registration declares the slot name it targets',
   registered.every((r) => typeof r.config.name === 'string' && r.config.name.length > 0))
+
+// --- the pending-approval frame resource -------------------------------------------------------
+//
+// The row is mounted when the call is dispatched; the Host takes the frame a moment later, just
+// before it raises the approval. So that frame cannot come from the log — nothing has been logged
+// yet — and it cannot be read only once either: it is read from the Host's exact Fetch route
+// (`/api/cua-preview.frame`) through a Client resource, and the provider keeps asking until the
+// answer changes. These checks pin the registration and every exit of that loop.
+
+check('apply() publishes exactly one resource provider',
+  providers.length === 1, `providers=${providers.length}`)
+const provider = providers[0]
+check('it claims this plugin\'s own resource protocol',
+  provider?.protocol === exportsValue.FRAME_PROTOCOL && exportsValue.FRAME_PROTOCOL === 'cua',
+  String(provider?.protocol))
+check('it opens a stream, which is what the resource service consumes',
+  typeof provider?.open === 'function')
+
+/**
+ * Drive the provider's stream to completion over a stubbed Fetch, collecting what it yields.
+ *
+ * @param address - the resource address to open.
+ * @param options.fetchImpl - the stubbed global fetch.
+ * @param options.abortAfterMs - release the resource this long after opening it.
+ * @returns {{frames: object[], requests: string[], error: string|null}}
+ */
+async function drainProvider(address, { fetchImpl, abortAfterMs } = {}) {
+  const realFetch = globalThis.fetch
+  const requests = []
+  globalThis.fetch = (url, init) => {
+    requests.push(String(url))
+    return Promise.resolve(fetchImpl(String(url), init))
+  }
+  const controller = new AbortController()
+  const timer = abortAfterMs === undefined ? null : setTimeout(() => controller.abort(), abortAfterMs)
+  const frames = []
+  let error = null
+  try {
+    for await (const frame of provider.open(address, { signal: controller.signal })) frames.push(frame)
+  } catch (thrown) {
+    error = String(thrown)
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+    globalThis.fetch = realFetch
+  }
+  return { frames, requests, error }
+}
+
+/** The address the row builds for one call, as the provider receives it. */
+const frameAddr = (callId) => exportsValue.frameAddress(callId)
+
+{
+  let calls = 0
+  const { frames, requests, error } = await drainProvider(frameAddr('call-1'), {
+    fetchImpl: () => {
+      calls += 1
+      return calls === 1
+        ? new Response('nothing yet', { status: 404 })
+        : new Response(Buffer.from([0x89, 0x50, 0x4e, 0x47]), {
+            status: 200,
+            headers: { 'content-type': 'image/png' },
+          })
+    },
+  })
+  check('a 404 is read as "not captured yet", so the provider asks again',
+    requests.length === 2 && error === null, `requests=${requests.length} error=${String(error)}`)
+  check('  ↳ the ask names the call on the documented route',
+    requests[0] === '/api/cua-preview.frame?callId=call-1', String(requests[0]))
+  check('  ↳ the frame is yielded exactly once, as a URL the row can render',
+    frames.length === 1 && frames[0]?.ok === true && typeof frames[0]?.value?.url === 'string',
+    JSON.stringify({ frames: frames.length, value: frames[0]?.value }))
+}
+
+{
+  // Asking again cannot change a failure that is not "nothing yet", so the stream must end.
+  const { frames, requests, error } = await drainProvider(frameAddr('call-1'), {
+    fetchImpl: () => new Response('no', { status: 500 }),
+  })
+  check('a failure other than 404 stops the provider instead of retrying',
+    requests.length === 1 && frames.length === 0 && error === null,
+    `requests=${requests.length} frames=${frames.length} error=${String(error)}`)
+}
+
+{
+  // Releasing the resource ends the loop at once; nothing may be left waiting behind it.
+  const started = Date.now()
+  const { frames, error } = await drainProvider(frameAddr('call-1'), {
+    fetchImpl: () => new Response('nothing yet', { status: 404 }),
+    abortAfterMs: 30,
+  })
+  const elapsed = Date.now() - started
+  check('releasing the resource ends the loop instead of leaving a timer behind',
+    frames.length === 0 && error === null && elapsed < 2000,
+    `frames=${frames.length} elapsed=${elapsed}ms error=${String(error)}`)
+}
+
+{
+  // An address for someone else's protocol must not produce a request at all.
+  let called = 0
+  const { frames, requests } = await drainProvider('dsh-resource://other/frame/call-1', {
+    fetchImpl: () => {
+      called += 1
+      return new Response('no', { status: 404 })
+    },
+  })
+  check('an address naming another protocol is never fetched',
+    requests.length === 0 && frames.length === 0 && called === 0, `requests=${requests.length}`)
+}
 
 // --- the same registrations, against the REAL slot registry ------------------------------------
 //
@@ -252,11 +376,19 @@ function realSlotsFace(core) {
 /**
  * The Client context `apply` needs, with the REAL slot registry underneath it.
  *
+ * `effect` and `resources` are stubbed here because what is under test in this section is the slot
+ * registry itself; the resource provider is exercised separately above.
+ *
  * @param core - the real `SlotCore` under test.
  * @returns a context good enough for `apply`.
  */
 const realCtx = (core) => ({
   slots: realSlotsFace(core),
+  effect: (callback) => {
+    callback()
+    return () => {}
+  },
+  resources: { register: () => () => {} },
 })
 
 {
@@ -359,8 +491,8 @@ function collect(node, type, out = []) {
  */
 /** Render one block through the row and return the expanded tree. */
 function render(block, loadImage, options = {}) {
-  const { callId = 'call-1' } = options
-  return expand(Row({ block, callId, loadImage }))
+  const { callId = 'call-1', useResource } = options
+  return expand(Row({ block, callId, loadImage, useResource }))
 }
 
 const attachment = {
@@ -667,8 +799,8 @@ for (const [label, block] of metaCases) {
 
 /** Render one stage exactly as 0.2.0-rc.2 hands it over: `phase` beside a stage-specific block. */
 function renderPhase(phase, block, loadImage, options = {}) {
-  const { callId = 'call-1' } = options
-  return expand(Row({ phase, block, callId, loadImage }))
+  const { callId = 'call-1', useResource } = options
+  return expand(Row({ phase, block, callId, loadImage, useResource }))
 }
 
 /** `PreparingToolCall`: identity and placement only — the arguments are not dispatched yet. */
@@ -726,6 +858,80 @@ const spanTexts = (tree) => collect(tree, 'span').map((span) => span.props?.chil
     collect(tree, 'img').length === 0, `img nodes=${collect(tree, 'img').length}`)
 }
 
+// --- the live screen of a pending approval -----------------------------------------------------
+//
+// This is the whole point of the running stage: the person answering the approval sees the screen
+// they are deciding about. The value arrives through the resource hook, which is why these checks
+// hand the row a stubbed `useResource` rather than a block.
+
+/** A resource hook answering with whatever the row should see for this render. */
+const resourceOf = (snapshot) => () => snapshot
+
+{
+  // Before the Host has taken the frame there is nothing to paint, and a placeholder would be a
+  // claim in the one moment that matters: the row paints nothing at all.
+  const tree = renderPhase('start', startedBlock, cachedLoader, {
+    useResource: resourceOf({ status: 'loading' }),
+  })
+  check('a running gated call paints nothing until a frame exists',
+    collect(tree, 'img').length === 0, `img nodes=${collect(tree, 'img').length}`)
+}
+
+{
+  const tree = renderPhase('start', startedBlock, cachedLoader, {
+    useResource: resourceOf({ status: 'live', value: { url: 'blob:pending-frame' } }),
+  })
+  const images = collect(tree, 'img')
+  check('a running gated call paints the live screen',
+    images.length === 1 && images[0]?.props?.src === 'blob:pending-frame',
+    `img nodes=${images.length} src=${String(images[0]?.props?.src)}`)
+  check('  ↳ and captions it as the current screen, not as an outcome',
+    collect(tree, 'div').some((d) => d.props?.children === exportsValue.PENDING_CAPTION),
+    exportsValue.PENDING_CAPTION)
+}
+
+{
+  // The row must ask the resource seat for the address the provider understands — a typo would
+  // silently paint nothing forever.
+  let asked = null
+  renderPhase('start', startedBlock, cachedLoader, {
+    useResource: (address) => {
+      asked = address
+      return { status: 'none' }
+    },
+  })
+  check('the row asks by resource address, built from the call id',
+    asked === 'dsh-resource://cua/frame/call-1' && asked === frameAddr('call-1'), String(asked))
+}
+
+{
+  // Only the two gated tools can have a pending frame; a tool that never asks must not look for one.
+  const tree = renderPhase('start', { ...startedBlock, name: 'browser_screenshot' }, cachedLoader, {
+    useResource: resourceOf({ status: 'live', value: { url: 'blob:pending-frame' } }),
+  })
+  check('a tool that never asks for approval paints no pending frame',
+    collect(tree, 'img').length === 0, `img nodes=${collect(tree, 'img').length}`)
+}
+
+{
+  // Once the result exists the row paints the action's own frames; the live screen is over.
+  const tree = renderPhase('result', resultBlock, cachedLoader, {
+    useResource: resourceOf({ status: 'live', value: { url: 'blob:pending-frame' } }),
+  })
+  const images = collect(tree, 'img')
+  check('a settled call paints its result frame and not the live screen',
+    images.length === 1 && images[0]?.props?.src === `blob:${attachment.attachmentId}`,
+    `img nodes=${images.length} src=${String(images[0]?.props?.src)}`)
+}
+
+{
+  // A host that mounts no resource service hands the row no hook; the row must still render.
+  const tree = renderPhase('start', startedBlock, cachedLoader)
+  check('a host with no resource hook still renders the row',
+    spanTexts(tree).includes('browser_act') && collect(tree, 'img').length === 0,
+    JSON.stringify(spanTexts(tree)))
+}
+
 {
   const tree = renderPhase('result', resultBlock, cachedLoader)
   check('a result stage paints the screenshot',
@@ -734,7 +940,8 @@ const spanTexts = (tree) => collect(tree, 'span').map((span) => span.props?.chil
 
 {
   // A call that has not produced a result paints no result frame, in either spelling: the frames of
-  // a gated action arrive with its result.
+  // a gated action arrive with its result. The live screen is the resource's business (checked
+  // above), and a host that offers no resource hook has none.
   const tree = renderPhase('start', startedBlock, cachedLoader)
   check('a started call paints no result frame before its result, in the old spelling too',
     collect(tree, 'img').length === 0, `img nodes=${collect(tree, 'img').length}`)

@@ -195,6 +195,19 @@ const checks = [
     verdict.approvalServicePresent === true, String(verdict.approvalServicePresent)],
   ['the attachment service is mounted in the real web profile',
     verdict.attachmentsServicePresent === true, String(verdict.attachmentsServicePresent)],
+  // The screen has to reach the DECISION, not only the record. While an approval is open nothing has
+  // been logged, so the frame travels from the Host's own memory over an exact Fetch route; this
+  // asserts the real Host offered the registry at all, and that the plugin's registration into it
+  // succeeded. `registered: false` is a legitimate state elsewhere (an in-process tree, a headless
+  // profile) and is reported rather than inferred from a missing log line — which is exactly why it
+  // can be asserted here.
+  ['the real Host offers a third-party plugin its exact-Fetch registry',
+    verdict.exactFetchRegistryPresent === true, String(verdict.exactFetchRegistryPresent)],
+  ['the pending-approval frame route is registered in the real product',
+    verdict.frameRouteRegistered === true,
+    `path=${String(verdict.frameRoutePath)} reason=${String(verdict.frameRouteReason)}`],
+  ['  ↳ on the path the Client asks for',
+    verdict.frameRoutePath === '/api/cua-preview.frame', String(verdict.frameRoutePath)],
   // The frames below are read off the real Session log the product wrote. The enforcement point
   // (`sessionController.attachment`, reached by the browser's image loader) lives in the API
   // gateway's isolation scope and cannot be called from a root-level patch row — so this asserts the

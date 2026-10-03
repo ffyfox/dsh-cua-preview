@@ -62,10 +62,13 @@ export class ApprovalUnavailableError extends Error {
  * "Do not append session events with a new `type` … live `Session.append()` cannot set that marker,
  * so the Session would refuse to reopen."
  *
- * The frame reaches the Client through the call's own `tool/result`, and this plugin invents no
- * event for it:
+ * The frame reaches the Client by two routes, and this plugin invents no event for either:
  *
- * 1. **Once the call returns**, `tools.js` saves the same bytes as an attachment and puts the
+ * 1. **While the approval is pending**, the bytes are held in `pending-frames.js` and served to the
+ *    operator's own browser by the exact Fetch route in `frame-route.js`. That is what makes the
+ *    decision an informed one: the screen is on screen *while* the question is being asked, instead
+ *    of arriving with the answer.
+ * 2. **Once the call returns**, `tools.js` saves the same bytes as an attachment and puts the
  *    reference in that call's own `tool/result` — a known event type whose image references the Host
  *    authorizes — so the frames stay readable in the transcript afterwards.
  */
@@ -75,22 +78,41 @@ export class CuaApprovalBroker {
   #ctx
   #artifactsDir
   #logger
+  #frames
 
   /**
    * @param {object} options
    * @param {object} options.ctx - Cordis context carrying `approval`, `attachments`, `logger`.
    * @param {string} options.artifactsDir - directory for screenshot evidence files.
    * @param {object} [options.logger] - optional logger; defaults to `ctx.logger`.
+   * @param {import('./pending-frames.js').PendingFrames} [options.frames] - table that keeps the
+   *   approval-time frame reachable while the approval is pending. Absent in a host that serves no
+   *   route; every other behaviour is then unchanged.
    */
-  constructor({ ctx, artifactsDir, logger }) {
+  constructor({ ctx, artifactsDir, logger, frames = null }) {
     this.#ctx = ctx
     this.#artifactsDir = artifactsDir
     this.#logger = logger ?? ctx.logger
+    this.#frames = frames
   }
 
   /** @returns {string} the directory holding screenshot evidence. */
   get artifactsDir() {
     return this.#artifactsDir
+  }
+
+  /**
+   * Stop serving the pending frame for one call.
+   *
+   * Called once the call's own result exists: that result carries the same picture, so the live
+   * preview has nothing left to add and the bytes should stop being reachable.
+   *
+   * @param {string} [callId] - the tool call that settled.
+   * @returns {void}
+   */
+  forgetPendingFrame(callId) {
+    if (typeof callId !== 'string') return
+    this.#frames?.forget(callId)
   }
 
   /**
@@ -164,10 +186,15 @@ export class CuaApprovalBroker {
       }
     }
 
+    // The bytes have to be reachable BEFORE the ask, not after it: the point of holding them is that
+    // the operator decides with the screen in front of them (`frame-route.js` serves them, and
+    // `tools.js` drops the entry again once the call's own result exists).
+    if (screenshot !== null && callId !== undefined) this.#frames?.record(callId, screenshot)
+
     // ---- Raise the official DSH approval request ------------------------------------------
     // The reason states WHAT is about to happen and stays on one line: it is the seam's free-text
     // field for *why the asker is asking* (`docs/subsystems/approval.md`), and the shipped panel
-    // renders it as the card's headline. The evidence travels by the route the class comment
+    // renders it as the card's headline. The evidence travels by the two routes the class comment
     // names, never through this string.
     const reason = description
 

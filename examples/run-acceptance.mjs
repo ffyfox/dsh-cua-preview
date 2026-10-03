@@ -136,8 +136,18 @@ let answererCalls = 0
 const askedEvents = []
 const decidedEvents = []
 
+/**
+ * Probes the answerer runs while an approval is open.
+ *
+ * A probe is how this harness stands where the operator's browser stands: the screen has to be
+ * readable *during* the question, not only afterwards.
+ */
+const approvalProbes = []
+
 ctx.on('approval/request', async (req) => {
   answererCalls += 1
+  // Probes run *inside* the ask, which is the only moment the pending-frame route is for.
+  for (const probe of approvalProbes) await probe(req)
   return 'allowed-once'
 })
 
@@ -156,6 +166,101 @@ const auditSeen = () => {
   auditWatermark = session.seq
 }
 auditSeen()
+
+// ---------------------------------------------------------------------------------------------
+// The pending-approval frame route — the screen has to reach the DECISION, not just the record.
+// ---------------------------------------------------------------------------------------------
+//
+// While an approval is open nothing has been logged yet, so the frame cannot be read out of the
+// session log: the call has produced no result, and the client-side image loader only resolves
+// references a known event carries. The Host therefore holds the frame it captured an instant
+// earlier (`src/pending-frames.js`) and serves it on the exact Fetch route the Connection documents
+// for a browser-native response (`docs/api-gateway.md`: "A feature that needs a streamed or
+// browser-native response registers an exact Connection Fetch route instead of defining a Remote
+// method").
+//
+// This section asks that route at the only moment it exists for: from inside the answerer, for the
+// very call being decided. The handler and the table behind it are the live ones; what this harness
+// does not mount is the Connection's own registration plumbing, so the registration call itself is
+// checked against a stub carrying the documented shape.
+
+console.log('\n=== The pending-approval frame route ===\n')
+
+const { FRAME_ROUTE, registerFrameRoute } = await import('../src/frame-route.js')
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+check('a host with no exact-Fetch registry registers no route, and the plugin still loads',
+  registerFrameRoute(ctx, cuaPreview.frames, undefined).registered === false)
+
+const routes = []
+let effectCalls = 0
+let injectedDeps = null
+
+/** The effect stub, counting how many registrations are owned by an effect (and so are undone). */
+const effectStub = (callback) => {
+  effectCalls += 1
+  const disposer = callback()
+  return () => {
+    if (typeof disposer === 'function') disposer()
+  }
+}
+
+// A context shaped like a Cordis one. The route is not registered from a one-shot read: `connection`
+// is not a dependency of this plugin, so the registration goes through `ctx.inject` and attaches when
+// that service appears. Measured against the real web profile, a one-shot `ctx.get` inside `apply`
+// found nothing while a later read found the registry — the inject path is the one that works.
+const routeCtx = {
+  effect: effectStub,
+  get: () => undefined,
+  inject: (deps, callback) => {
+    injectedDeps = deps
+    callback({
+      connection: { fetch: { register: (route) => { routes.push(route); return () => {} } } },
+      effect: effectStub,
+    })
+  },
+}
+const routeRegistration = registerFrameRoute(routeCtx, cuaPreview.frames, undefined)
+check('the route is registered once, on the path the client asks for',
+  routes.length === 1 && routes[0]?.path === FRAME_ROUTE && FRAME_ROUTE === '/api/cua-preview.frame',
+  routes.map((route) => route.path).join(', '))
+check('  ↳ as an exact GET/HEAD route with its body handling declared up front',
+  JSON.stringify(routes[0]?.methods) === JSON.stringify(['GET', 'HEAD']) &&
+    routes[0]?.requestBody === 'buffered' && typeof routes[0]?.fetch === 'function',
+  `methods=${JSON.stringify(routes[0]?.methods)} requestBody=${String(routes[0]?.requestBody)}`)
+check('  ↳ it attaches by waiting for the connection service, not by reading it once',
+  JSON.stringify(injectedDeps) === JSON.stringify(['connection']), JSON.stringify(injectedDeps))
+check('  ↳ the registration lives inside an effect, so unloading withdraws it',
+  effectCalls === 1 && routeRegistration.registered === true &&
+    routeRegistration.path === FRAME_ROUTE && routeRegistration.reason === null,
+  JSON.stringify(routeRegistration))
+
+/**
+ * Ask the registered route for one call, the way the operator's browser does.
+ *
+ * @param callId - the call whose frame is wanted; an empty string asks for none.
+ * @param method - `GET` (the picture) or `HEAD` (is it there yet).
+ * @returns {Promise<{status: number, type: string|null, cache: string|null, body: Buffer|null}>}
+ */
+async function askFrameRoute(callId, method = 'GET') {
+  const handler = routes[0]?.fetch
+  const url = `http://127.0.0.1${FRAME_ROUTE}?callId=${encodeURIComponent(callId)}`
+  const response = await handler(new Request(url, { method }))
+  return {
+    status: response.status,
+    type: response.headers.get('content-type'),
+    cache: response.headers.get('cache-control'),
+    body: method === 'HEAD' ? null : Buffer.from(await response.arrayBuffer()),
+  }
+}
+
+// Armed for the gated click below: the probe asks the route from inside the ask.
+let duringAsk = null
+let headDuringAsk = null
+approvalProbes.push(async (req) => {
+  duringAsk = await askFrameRoute(req.callId)
+  headDuringAsk = await askFrameRoute(req.callId, 'HEAD')
+})
 
 // Drive the page to a known state, then perform a gated click that also submits a form.
 const tool = ctx.tools.get('browser_act')
@@ -182,6 +287,42 @@ const execBase = {
 const clickResult = await tool.execute({ action: 'click', selector: '#go' }, execBase)
 
 auditSeen()
+
+// ---- The screen was already readable while the card was open ---------------------------------
+//
+// `duringAsk` was captured from inside the answerer, so it describes the route at the exact moment
+// the operator would be looking at the card — not after the action had run.
+
+approvalProbes.length = 0
+
+check('while the approval was open, the current screen was already servable',
+  duringAsk?.status === 200 && duringAsk?.type === 'image/png',
+  JSON.stringify({ status: duringAsk?.status, type: duringAsk?.type }))
+check('  ↳ and it is a complete PNG, not an empty body',
+  duringAsk?.body !== null && duringAsk.body.byteLength > 0 &&
+    duringAsk.body.subarray(0, 8).equals(PNG_MAGIC),
+  `bytes=${duringAsk?.body?.byteLength ?? 0}`)
+{
+  const approvalFrame = await readFile(clickResult.approvalScreenshotPath)
+  check('  ↳ the bytes are the approval-time frame itself',
+    duringAsk?.body?.equals(approvalFrame) === true,
+    `route=${duringAsk?.body?.byteLength ?? 0}B file=${approvalFrame.byteLength}B`)
+}
+check('  ↳ marked no-store, so one call id is never served a stale picture',
+  duringAsk?.cache === 'no-store', String(duringAsk?.cache))
+check('  ↳ a HEAD ask answers with the same status and no body',
+  headDuringAsk?.status === 200 && headDuringAsk?.body === null && headDuringAsk?.type === 'image/png',
+  JSON.stringify({ status: headDuringAsk?.status, type: headDuringAsk?.type }))
+
+{
+  const settled = await askFrameRoute(execBase.callId)
+  check('once the call has settled the route serves nothing: the result carries the frame',
+    settled.status === 404, `status=${settled.status}`)
+}
+check('an unknown call id is a 404, not an error',
+  (await askFrameRoute('call-that-never-happened')).status === 404)
+check('a request naming no call at all is reported as malformed',
+  (await askFrameRoute('')).status === 400)
 
 check('exactly one approval/asked was appended', askedEvents.length === 1,
   `count=${askedEvents.length}`)

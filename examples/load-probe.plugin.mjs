@@ -32,6 +32,7 @@
  */
 
 import { writeFileSync } from 'node:fs'
+import { cuaPreviewOf } from '../src/index.js'
 
 export const name = 'cua-preview-load-probe'
 // `sessions` is required to create the live Session the gated action is raised against — Cordis
@@ -119,6 +120,25 @@ export function apply(ctx, config = {}) {
  * @param listed - the browser tools found in the live registry.
  * @param resultPath - where to write the JSON verdict.
  */
+/**
+ * Wait, bounded, for the pending-approval frame route to attach.
+ *
+ * The route is registered through `ctx.inject`, so it waits for the Host's Connection service instead
+ * of racing it; the record is live and flips to `registered: true` when that service appears. Waiting
+ * here is what makes the verdict describe the outcome rather than the order the rows happened to load.
+ *
+ * @param instance - the plugin instance (`cuaPreviewOf()`).
+ * @param deadline - when to stop waiting (epoch milliseconds).
+ * @returns {{registered: boolean, path: string|null, reason: string|null}} the live record.
+ */
+async function waitForFrameRoute(instance, deadline) {
+  const record = instance?.frameRoute ?? { registered: false, path: null, reason: 'no plugin instance' }
+  while (record.registered !== true && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+  return record
+}
+
 async function run(ctx, config, listed, resultPath) {
   const verdict = {
     probe: 'cua-preview-load-probe',
@@ -126,6 +146,9 @@ async function run(ctx, config, listed, resultPath) {
     expected: EXPECTED,
     approvalServicePresent: ctx.get('approval') !== undefined,
     attachmentsServicePresent: ctx.get('attachments') !== undefined,
+    // Whether the Host offers a third-party plugin its exact-Fetch registry at all. This is the one
+    // fact the plugin cannot verify about its own Host from inside its own module.
+    exactFetchRegistryPresent: typeof ctx.get?.('connection')?.fetch?.register === 'function',
     checkedAt: new Date().toISOString(),
   }
 
@@ -142,12 +165,24 @@ async function run(ctx, config, listed, resultPath) {
     verdict.refusalError = errorSummary(error)
   }
 
+  // The route attaches through `ctx.inject`, so it waits for the Host's Connection service rather than
+  // racing it — and that service can appear after this plugin's own dependencies are ready. Reading
+  // the record once, immediately, would report the race instead of the result.
+  const frameRoute = await waitForFrameRoute(cuaPreviewOf(), Date.now() + 10_000)
+  verdict.frameRouteRegistered = frameRoute.registered === true
+  verdict.frameRoutePath = frameRoute.path ?? null
+  verdict.frameRouteReason = frameRoute.reason ?? null
+
   verdict.ok = listed.length === EXPECTED.length &&
     verdict.actionGranted === true &&
     verdict.frameCount === 2 &&
     verdict.framesAreDistinct === true &&
     verdict.framesAreImageBlocks === true &&
     verdict.blankNavigationOmittedFrame === true &&
+    // The screen has to be readable while the approval is open, not only afterwards: that is the
+    // whole difference between reviewing an action and reviewing its record.
+    verdict.frameRouteRegistered === true &&
+    verdict.frameRoutePath === '/api/cua-preview.frame' &&
     // The log must stay reopenable: no event type outside the harness vocabulary, and nothing this
     // plugin wrote.
     Array.isArray(verdict.unknownEventTypes) && verdict.unknownEventTypes.length === 0 &&

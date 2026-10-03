@@ -100,6 +100,15 @@ ran, so the one image returned *is* the approval-time frame, captioned `at appro
 A screen that is genuinely blank (an unloaded, empty tab) emits no frame at all rather than a useless
 white rectangle.
 
+**While you are deciding, the screen is already on screen.** The call's row paints the current screen from
+the moment the approval appears, and it is a *live* read: at that point nothing has been logged, so the
+frame comes from the Host's own copy of it — the bytes captured an instant before the question was asked,
+served on the exact Fetch route the Connection documents for a browser-native response. The route stops
+answering as soon as the call settles, because the result then carries the same picture as
+`before the action`. [docs/design.md](docs/design.md) has both routes, the reason a plugin may not append
+a session event of its own, and why the shipped single-occupancy slot inside the approval card is left
+alone.
+
 ## What the model is told when the user says no
 
 A refusal is a **successful** tool result, not an error — an error reads as "the call failed, try

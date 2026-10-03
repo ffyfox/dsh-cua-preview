@@ -25,6 +25,25 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   real-product probe reports the same two facts from a log the shipped `dsh` binary wrote. The defect
   survived a release because nothing had ever looked at the log the plugin produced.
 
+### Added
+
+- **The screen is on screen while the approval is being decided.** The call's row now paints the current
+  screen from the moment the card appears, read *live* from the Host rather than from the log: the frame
+  captured an instant before the ask is held under the call id (`src/pending-frames.js`) and served to the
+  operator's own browser on an exact Fetch route, `GET`/`HEAD` `/api/cua-preview.frame`
+  (`src/frame-route.js`). That route is the shape the documents name for a browser-native response
+  (`docs/api-gateway.md`: *"A feature that needs a streamed or browser-native response registers an exact
+  Connection Fetch route instead of defining a Remote method"*; `docs/subsystems/web-client.md`:
+  *"feature-owned downloads register exact Fetch routes"*), admitted only through the browser-session trust
+  boundary, marked `no-store`, and withdrawn with the plugin. The Client half reads it through a resource
+  of its own, `dsh-resource://cua/frame/<callId>`, retrying on `404` with a bounded backoff — the row is
+  mounted when the call is dispatched, a moment before the capture exists. The route stops serving a call
+  the instant its own result exists (the result carries the same picture), and it is skipped entirely on a
+  Host that mounts no such registry: the tools load and every gated action works either way. `connection`
+  is deliberately **not** a declared dependency, so the route attaches through `ctx.inject` when that
+  service appears — a one-shot `ctx.get('connection')` inside `apply` was measured to lose that race in the
+  real web profile, which would have silently disabled the preview in the only profile that has one.
+
 ### Changed
 
 - **A granted action now returns both frames, and the row captions each by role.** The approval-time
@@ -34,7 +53,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   never has to infer a caption from an image's position or from `granted` alone. The row therefore paints
   `before the action` above `after the action`, and a legacy result without `frames` still captions its
   single frame the way the build that wrote it did. Nothing the plugin shows is carried by a session event
-  of its own any more: once the call returns, the row paints the frames from the call's own result.
+  of its own any more: while the approval is open the row paints the live screen (see Added), and once the
+  call returns it paints the frames from the call's own result.
 - **Adapted to DSH `0.2.0-rc.2`.** The development dependencies now track that release train
   (`@deepseek-ai/dsh-*` `0.2.0-rc.2`, `@deepseek-ai/cordis` `4.0.4`, `@deepseek-ai/cordis-plugin-loader`
   `1.0.5`, `@deepseek-ai/schemastery` `3.18.4`), and the obsolete `@deepseek-ai/dsh-code-runtime` dev
@@ -119,8 +139,8 @@ the checks that now pin them.
 
 - The tool descriptions state the screenshot timing, and the gated tools state the stop-and-ask rule, so
   both are in the system prompt before the model acts rather than only in a result afterwards.
-- The approval `reason` carries only the action description — no file path, dimensions or byte count,
-  which had grown the card and been clamped by one renderer.
+- The approval `reason` carries only the action description: no file path, dimensions or byte count. The
+  shipped panel renders that string as the card's headline, so it stays one line.
 - Target naming follows the page's own accessible name instead of the CSS selector alone, and
   `input.value` is excluded from that chain except for submit-style inputs.
 - Tests depend on the published DSH packages as dev dependencies, so the suite is reproducible on any

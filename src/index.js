@@ -16,6 +16,8 @@ import { join } from 'node:path'
 import { BrowserController } from './browser.js'
 import { CuaApprovalBroker } from './approval-broker.js'
 import { registerBrowserTools } from './tools.js'
+import { PendingFrames } from './pending-frames.js'
+import { registerFrameRoute } from './frame-route.js'
 
 export const name = 'dsh-cua-preview'
 
@@ -44,26 +46,42 @@ export function apply(ctx, config = {}) {
     headless: config.headless ?? true,
   })
 
+  // The approval-time frame is held here for as long as an approval is pending, so the operator's
+  // own browser can put the screen in front of the person making the decision. `frame-route.js`
+  // serves it; the two gated tools drop it again the moment their result exists.
+  const frames = new PendingFrames()
+
   const broker = new CuaApprovalBroker({
     ctx,
     artifactsDir,
     logger: ctx.logger,
+    frames,
   })
 
   registerBrowserTools(ctx, { browser, broker, logger: ctx.logger })
+  // Reported, not asserted: a Host without an exact-Fetch registry is a normal state (an in-process
+  // tree, a headless profile), and the operator's browser then simply shows no live screen while an
+  // approval is open. The object is a live record — `connection` is not a declared dependency, so the
+  // route attaches through `ctx.inject` whenever that service appears, which can be after this line.
+  // `frameRoute.registered` is on the instance so a host or probe can tell the two situations apart
+  // instead of guessing from the absence of a log line.
+  const frameRoute = registerFrameRoute(ctx, frames, ctx.logger)
 
   // Test/host introspection only. This is deliberately NOT a Cordis service: publishing one
   // would add a public surface the task did not ask for, and `ctx.set` requires a declared
   // `provide`. Note the plugin receives its own derived context, so instances are tracked in a
   // list rather than keyed by a context identity the caller cannot reconstruct.
-  const instance = { browser, broker, artifactsDir }
+  const instance = { browser, broker, artifactsDir, frames, frameRoute }
   liveInstances.push(instance)
 
   // Explicit cleanup: the browser is an external process, so it needs a disposer rather than
-  // relying on the automatic event/tool teardown (`docs/user/develop/framework/index.md`).
+  // relying on the automatic event/tool teardown (`docs/user/develop/framework/index.md`). The held
+  // frames go with it: they are pictures of the operator's screen and must not outlive the instance
+  // that took them. (The route itself is withdrawn by the effect `registerFrameRoute` owns.)
   ctx.effect(() => () => {
     const index = liveInstances.indexOf(instance)
     if (index >= 0) liveInstances.splice(index, 1)
+    frames.clear()
     return browser.close()
   }, 'dsh-cua-preview: close browser')
 
@@ -77,7 +95,8 @@ export function apply(ctx, config = {}) {
  *
  * @param {object} [filter]
  * @param {string} [filter.artifactsDir] - select the instance writing to this directory.
- * @returns {{browser: object, broker: object, artifactsDir: string}|undefined}
+ * @returns {{browser: object, broker: object, artifactsDir: string, frames: object,
+ *   frameRoute: {registered: boolean, path: string, reason: string|null}}|undefined}
  */
 export function cuaPreviewOf(filter = {}) {
   if (filter.artifactsDir !== undefined) {

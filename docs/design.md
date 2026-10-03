@@ -87,7 +87,46 @@ reference carried only in `result.meta` is in none of those positions, so a card
 `meta` alone renders its caption and then *"screenshot could not be loaded"*. The frames therefore ride
 in the call's own result content, and `meta.frames` says which is which.
 
-## The frames on screen once the call has settled
+## The frames on screen: one live frame while deciding, two frames afterwards
+
+A gated action is reviewed in two stages, and each stage has its own picture.
+
+**While the approval is open**, the row paints the screen as it is *right now*, so the decision is made
+with the screen in front of it. Nothing has been logged at that moment — no result exists yet, and the
+client-side image loader only resolves references that a known event carries — so these bytes cannot come
+from the log. They come from the Host's own memory: the broker captures the frame an instant before it
+asks, `pending-frames.js` holds it under the call id, and the operator's own browser reads it from the
+exact Fetch route the Connection documents for a browser-native response:
+
+> A feature that needs a streamed or browser-native response registers an exact Connection Fetch route
+> instead of defining a Remote method. — `docs/api-gateway.md`
+
+> The Connection owns … exact Fetch routes …; feature-owned downloads register exact Fetch routes.
+> — `docs/subsystems/web-client.md`
+
+An image is exactly that: a browser-native, non-JSON response, behind the same browser-session trust
+boundary as every other `/api` request. The Client half reads it through a resource of its own,
+`dsh-resource://cua/frame/<callId>` — the one seat that hands a component a live value synchronously —
+and that provider has to ask more than once, because the row is mounted when the call is dispatched, a
+moment *before* the Host takes the frame.
+
+One seat looks like it should carry this and deliberately does not. **`conversation.approval.detail`** is
+declared by the shipped panel and rendered inside the card above the decision buttons, which is exactly
+where a frame belongs — but it is a `single` slot, and `@deepseek-ai/dsh-client-ui-chat` already registers
+`ApprovalCommand` into it at priority 0. `SlotCore.register` throws on a second same-priority entry, and
+the throw lands in whichever plugin registers second — which was the shipped `ui-chat`, failing the whole
+client plugin set:
+
+```text
+Failed to load plugins
+@deepseek-ai/dsh-client-ui-chat
+single slot "conversation.approval.detail" already has a registration at priority 0
+(registered by Ba) — register at a different priority to shadow it (lowest renders)
+```
+
+A lower priority would *shadow* the shipped occupant, deleting the pending call's command preview from the
+approval card for every tool — a global regression traded for a plugin-local feature. The plugin therefore
+paints the live frame in its own row instead.
 
 **Once the call has settled**, the row paints the frames of the action in the order they happened:
 `before the action` / image, then `after the action` / image. A refusal ran nothing: its single frame is
@@ -95,12 +134,23 @@ the approval-time state and is captioned `at approval time (no action ran)`. Rol
 `presentationMeta.frames`, never from an image's position and never from `granted` alone — so a grant
 whose post-action capture failed keeps `before the action` on its one frame.
 
+What the live frame costs, stated rather than hidden:
+
+- **It is a live read, not a record.** The route answers `404` the moment the call settles, because the
+  result then carries the same picture, and the held entry expires on its own if a call dies mid-ask.
+- **It is one more public surface.** A `GET`/`HEAD` route on the Host's `/api`, admitted only through the
+  browser-session trust boundary, marked `no-store`, registered inside an effect so unloading withdraws
+  it, and skipped entirely on a Host that mounts no such registry.
+- **The row has to ask again.** The first ask normally lands before the capture exists; the provider
+  retries with a bounded backoff until the frame is there, the resource is released, or the window ends.
+
 ## What the plugin claims, and what it deliberately leaves alone
 
 The Client half's entire footprint is three keyed `tool.call.toolview` seats — for `browser_act`,
 `browser_navigate` and `browser_screenshot`, the three tools that carry an image. `browser_snapshot`
-returns text only, so it needs no row. It registers no event definition, injects only `slots`, the one
-service its rows genuinely need, and registers into **no `single` slot**, in particular not
+returns text only, so it needs no row. It registers no event definition, injects only `slots` and
+`resources` (the two services its rows genuinely need: the keyed seats, and the resource seat that hands
+every slot component `useResource`), and registers into **no `single` slot**, in particular not
 `conversation.approval.detail` or `tool.call.images`. The rule this encodes: the only safe slots for a
 third-party client plugin are ones it owns (keyed seats) or a `single` slot it has verified is free
 against the *resolved* install — because a collision fails an unrelated shipped package, not the
