@@ -148,9 +148,6 @@ async function run(ctx, config, listed, resultPath) {
     expected: EXPECTED,
     approvalServicePresent: ctx.get('approval') !== undefined,
     attachmentsServicePresent: ctx.get('attachments') !== undefined,
-    // Whether the Host offers a third-party plugin its exact-Fetch registry at all. This is the one
-    // fact the plugin cannot verify about its own Host from inside its own module.
-    exactFetchRegistryPresent: typeof ctx.get?.('connection')?.fetch?.register === 'function',
     checkedAt: new Date().toISOString(),
   }
 
@@ -171,6 +168,13 @@ async function run(ctx, config, listed, resultPath) {
   // racing it — and that service can appear after this plugin's own dependencies are ready. Reading
   // the record once, immediately, would report the race instead of the result.
   const frameRoute = await waitForFrameRoute(cuaPreviewOf(), Date.now() + 10_000)
+  // Whether the Host offers a third-party plugin its exact-Fetch registry at all. This is the one
+  // fact the plugin cannot verify about its own Host from inside its own module — read AFTER the
+  // wait, because a row can start before the Connection service is mounted (the plugin's own route
+  // attaches through `ctx.inject` for exactly that reason). A synchronous read here reports the load
+  // order, not the Host: on DSH 0.2.1-alpha.1 the service appears after this probe row starts, while
+  // the route still attaches. By this point the registration above has happened, so this is a fact.
+  verdict.exactFetchRegistryPresent = typeof ctx.get?.('connection')?.fetch?.register === 'function'
   verdict.frameRouteRegistered = frameRoute.registered === true
   verdict.frameRoutePath = frameRoute.path ?? null
   verdict.frameRouteReason = frameRoute.reason ?? null
