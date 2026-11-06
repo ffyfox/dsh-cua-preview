@@ -1129,14 +1129,13 @@ console.log('\n=== Fail-closed behaviour: the refusal reaches the model ===\n')
 // says in the result that nobody was asked.
 // ---------------------------------------------------------------------------------------------
 //
-// This is what the operator's own profiles do — `defaultPreset: danger-full-access` maps to
-// `approval: never` — and an ask there could only produce `rejected` without consulting anyone
-// (`docs/subsystems/approval.md`: "`never` deterministically returns `rejected` without dispatching
-// any answerer"). The broker therefore skips the ask and returns its own `not-asked` decision. The
-// answerer mounted above would GRANT, so "it was never consulted" is decisive rather than
-// coincidental. The policy is switched through `setApprovalPolicy`, the documented single write
-// path (it appends the `approval/policy` event `effectivePolicy` folds), which is exactly what a
-// preset switch does.
+// A `danger-full-access` default maps to `approval: never` — an ask there could only produce
+// `rejected` without consulting anyone (`docs/subsystems/approval.md`:
+// "`never` deterministically returns `rejected` without dispatching any answerer"). The broker
+// therefore skips the ask and returns its own `not-asked` decision. The answerer mounted above
+// would GRANT, so "it was never consulted" is decisive rather than coincidental. The policy is
+// switched through `setApprovalPolicy`, the documented single write path (it appends the
+// `approval/policy` event `effectivePolicy` folds), which is exactly what a preset switch does.
 
 console.log('\n--- the never policy: the action runs and nobody is asked ---\n')
 

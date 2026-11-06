@@ -10,7 +10,7 @@
  * Web UI is never touched.
  *
  * Two things are pinned on purpose so the verdict describes the **plugin** rather than whichever
- * preset this machine happens to run: the approval policy is forced to `ask` (a `danger-full-access`
+ * preset the profile defaults to: the approval policy is forced to `ask` (a `danger-full-access`
  * default preset is `approval: never`, under which `ApprovalService.decide()` rejects before the
  * probe's answerer is ever consulted), and the approval sentence's expected language comes from the
  * locale the profile's own `cordis.patch.yml` declares rather than from the Host channel the plugin
