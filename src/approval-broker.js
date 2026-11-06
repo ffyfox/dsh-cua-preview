@@ -7,7 +7,9 @@
  * 1. **Gate, then ask, then act.** ZCode's `permission-flow.ts` computes a permission decision,
  *    and only a decision of exactly `allow` proceeds; `ask` raises a request through
  *    `permissionBroker.requestPermission(...)` and everything else is denied. The browser action
- *    is only executed after the broker returns a grant for *that* action.
+ *    is only executed after the broker returns a grant for *that* action. A grant is the seam's
+ *    `allowed-once`, or — when the session's approval policy is `never` — the plugin's own
+ *    `not-asked` decision, which records that the session forbids prompting and nobody was asked.
  *
  * 2. **Fail closed, always.** ZCode's broker returns typed errors
  *    (`notAuthorized`, `unavailable`, `actionUnavailable`) and never treats a missing responder
@@ -40,6 +42,16 @@ export const GRANTING_OUTCOME = 'allowed-once'
 
 /** Every outcome the DSH approval seam can return. */
 export const APPROVAL_OUTCOMES = ['allowed-once', 'rejected', 'cancelled', 'unavailable']
+
+/**
+ * The broker's own decision when the session forbids asking anyone.
+ *
+ * Deliberately **not** an `ApprovalOutcome`: the seam is never entered, so borrowing one of its
+ * values would lie. `allowed-once` would claim a consent nobody gave; `rejected` would refuse an
+ * action the session never asked about. The policy gets its own fact — the session turned prompts
+ * off, so no one was asked, and the caller reports exactly that.
+ */
+export const NOT_ASKED = 'not-asked'
 
 export class ApprovalUnavailableError extends Error {
   constructor(message, options) {
@@ -116,8 +128,11 @@ export class CuaApprovalBroker {
   }
 
   /**
-   * Ask the user to approve one browser action, attaching a rendered screenshot of the current
-   * screen to the review material.
+   * Decide one browser action: ask the user when the session allows it, or — when the session's
+   * approval policy is `never` — run it without asking and record that no one was asked.
+   *
+   * The screenshot of the current screen is captured first, so the ask (when there is one) carries
+   * the evidence the user decides on, and the ungated path still reports the pre-action frame.
    *
    * @param {object} input
    * @param {object} input.agent - the asking agent (from `exec.agent`).
@@ -126,10 +141,13 @@ export class CuaApprovalBroker {
    * @param {string} input.action - one of `click` | `fill` | `submit` | `navigate`.
    * @param {string} input.description - human-readable description of the action.
    * @param {AbortSignal} [input.signal] - the tool execution signal.
-   * @param {() => Promise<object>} input.capture - captures the current screen; may throw.
+   * @param {(kind: 'approval'|'before') => Promise<object>} input.capture - captures the current
+   *   screen; may throw. `kind` names what the frame is for: the approval card, or the pre-action
+   *   evidence when the session's policy skips asking.
    * @param {() => Promise<{blank: boolean}>} [input.probeScreen] - reports whether the current
    *   screen is an unloaded empty document; a blank screen yields no credential frame at all.
-   * @returns {Promise<object>} the broker's closed result.
+   * @returns {Promise<object>} the broker's closed result; `granted` is true for `allowed-once` and
+   *   for `not-asked`, and `policy` records which policy produced it.
    */
   async requestActionApproval({ agent, callId, toolName, action, description, signal, capture, probeScreen }) {
     const requestId = `cua_${randomUUID()}`
@@ -149,13 +167,12 @@ export class CuaApprovalBroker {
       return failure
     }
 
-    // Which policy governed this ask is a fact OF the decision, not decoration. Under `never` the
-    // service returns `rejected` before dispatching any answerer, so the same outcome means "a human
-    // said no" under `ask` and "nobody was asked" under `never` — and the tool layer must not tell
-    // the model the first when the second happened. Read through the documented accessor
-    // (`docs/subsystems/approval.md`: "Consumers read it with `ctx.approval.effectivePolicy(session)`"),
-    // BEFORE the request: what matters is the policy the service decided under, and reading it after
-    // a user switched presets mid-ask would describe the wrong decision.
+    // Read the policy BEFORE deciding whether to ask — through the documented accessor
+    // (`docs/subsystems/approval.md`: "Consumers read it with `ctx.approval.effectivePolicy(session)`").
+    // Under `never` the service would return `rejected` before consulting any answerer, so an ask
+    // here could only manufacture the appearance of a refusal. The broker therefore skips the ask
+    // and records `not-asked`; reading the policy after the request would also describe the wrong
+    // decision if the user switched presets mid-ask.
     const policy = this.#policyOf(approval, agent)
 
     // ---- Is there a screen worth showing? --------------------------------------------------
@@ -185,7 +202,7 @@ export class CuaApprovalBroker {
     let captureError = null
     if (!blankScreen) {
       try {
-        screenshot = await capture()
+        screenshot = await capture(policy === 'never' ? 'before' : 'approval')
       } catch (error) {
         captureError = error
         this.#logger?.warn?.(
@@ -194,6 +211,32 @@ export class CuaApprovalBroker {
           }`,
         )
       }
+    }
+
+    // ---- A session that forbids asking ----------------------------------------------------
+    // `never` returns `rejected` inside the service, before any answerer could be consulted, so an
+    // ask here cannot produce a decision — only the appearance of a refusal nobody made. The
+    // policy has already said "do not prompt"; the plugin therefore does not prompt, and records
+    // that fact instead of borrowing an outcome that means something else.
+    //
+    // The session log gets no `approval/asked` + `approval/decided` pair for these calls, because
+    // no ask happened. The frame captured above still travels with the call: it is the pre-action
+    // screen, the same evidence an approval would have shown, and the tool result carries it as
+    // its `before` frame.
+    if (policy === 'never') {
+      const result = {
+        requestId,
+        action,
+        decision: NOT_ASKED,
+        granted: true,
+        reason: description,
+        policy,
+        screenshot,
+        captureError: captureError === null ? null : String(captureError),
+        frameOmitted: blankScreen ? 'blank-screen' : null,
+      }
+      this.decisions.push(result)
+      return result
     }
 
     // The bytes have to be reachable BEFORE the ask, not after it: the point of holding them is that

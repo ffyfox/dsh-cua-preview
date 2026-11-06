@@ -2,21 +2,21 @@
 
 [English](README.md) | 中文
 
-一个 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 插件：驱动浏览器，每一次导航或动作调用都由 DSH
-审批把关，并把**当前屏幕截图交给用户，在动作执行之前审阅**。
+一个 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 插件：驱动浏览器。在允许审批提示的会话里，每一次导航或动作调用都由 DSH
+审批把关，并把**当前屏幕截图交给用户，在动作执行之前审阅**；当会话的审批策略是 `never`（关闭审批提示，例如官方 `danger-full-access` 预设）时，弹窗不可能存在，这些调用会直接执行，结果里写明 `approval: not asked`。
 
 审批架构借鉴了 ZCode 的 `cua-permission-broker`（仅设计层面借鉴，未复制任何 ZCode 源码）。
 
 ## 它做什么
 
-| 工具 | 需要审批 | 返回 |
+| 工具 | 审批 | 返回 |
 |---|---|---|
-| `browser_navigate` | 是 | 导航之后的页面 |
-| `browser_act`（`click` / `fill` / `submit`） | 是 | 动作之后的页面 |
+| `browser_navigate` | `ask` 会话询问 | 导航之后的页面 |
+| `browser_act`（`click` / `fill` / `submit`） | `ask` 会话询问 | 动作之后的页面 |
 | `browser_snapshot` | 否 | 当前 URL、标题与可见文本 |
 | `browser_screenshot` | 否 | 当前屏幕的图片 |
 
-只读的两个工具永远不会触发审批，因为它们都无法改变页面。「导航之后」与「动作之后」都指**页面被给了一段有上限的时间去反应之后**——见[等页面反应完](#等页面反应完)。需要把关的两个会先询问——用界面自身语言写成的一行文字——并且除非回答是「允许一次」，否则什么都不做。
+只读的两个工具永远不会触发审批，因为它们都无法改变页面。「导航之后」与「动作之后」都指**页面被给了一段有上限的时间去反应之后**——见[等页面反应完](#等页面反应完)。需要把关的两个在 `ask` 会话里会先询问——用界面自身语言写成的一行文字——并且除非回答是「允许一次」，否则什么都不做；在 `never` 会话里没有可回答的询问，它们直接执行，结果写明 `approval: not asked`——见[当会话关闭审批提示](#当会话关闭审批提示)。
 
 **在 DSH `0.2.0-rc.2` 上，这行文字固定为英文**：该版本移除了插件可以查询的 Host 侧语言读取通道；在 `0.1.5-rc.2`/`rc.3` 上仍会本地化。机制见 [docs/design.md](docs/design.md)，并且本仓库的真机检查会断言这一限制，而不是把它藏起来。
 
@@ -76,7 +76,7 @@ Chrome 会依次通过 `$DSH_CUA_CHROME_PATH` 与常见的 Linux 安装路径查
 
 ## 截图模型（一段话）
 
-审批发生在动作**之前**，因此存在两帧画面，各自按其本来含义命名。**动作之后**的那一帧是模型收到的结果图片，因为模型若把动作前的画面当成「结果」，就会断定动作失败了。**审批当时**的那一帧——也就是请用户批准的那张画面——在同一次结果里排在前面返回，标注为 `before the action`，于是这次调用的行读起来就是一条时间线。两帧都随这次调用自己的 `tool/result` 内容下发，这正是它们可被读取的原因：Host 只在**某条已知事件的内容里**携带该引用时，才为图片读取授权；`presentationMeta.frames` 逐张标明角色。**插件自己的会话事件完全不能用**——那会让整个会话再也打不开，见 `docs/design.md`。用户拒绝时没有动作发生，唯一返回的那张图**就是**审批当时的画面，标注为 `at approval time (no action ran)`。真正空白的屏幕（未加载的空标签页）不会发出任何图片，而不是发一张无用的白图。
+审批发生在动作**之前**，因此存在两帧画面，各自按其本来含义命名。**动作之后**的那一帧是模型收到的结果图片，因为模型若把动作前的画面当成「结果」，就会断定动作失败了。**动作之前**的那一帧——也就是请用户批准的那张画面；当审批提示被关闭时，就是动作前一刻的屏幕——在同一次结果里排在前面返回，标注为 `before the action`，于是这次调用的行读起来就是一条时间线。两帧都随这次调用自己的 `tool/result` 内容下发，这正是它们可被读取的原因：Host 只在**某条已知事件的内容里**携带该引用时，才为图片读取授权；`presentationMeta.frames` 逐张标明角色。**插件自己的会话事件完全不能用**——那会让整个会话再也打不开，见 `docs/design.md`。用户拒绝时没有动作发生，唯一返回的那张图**就是**审批当时的画面，标注为 `at approval time (no action ran)`。真正空白的屏幕（未加载的空标签页）不会发出任何图片，而不是发一张无用的白图。
 
 **你在做决定的时候，屏幕已经在屏幕上了。** 审批卡片出现的那一刻，这次调用的行就会画出**当前**屏幕，而且是一次**实时读取**：那一刻什么都还没落日志，所以这张图来自 Host 自己手里那份——就在提问前一刻截下的字节，经 Connection 为「浏览器原生响应」规定的 exact Fetch route 送出。调用一结束这条路由就不再应答，因为此时结果里已经带着同一张画面（标注为 `before the action`）。
 
@@ -104,16 +104,21 @@ the user rejected tool "browser_act" —— 这是人的决定，不是调用失
 
 三种「未获批准」的结果措辞各不相同，模型因此能区分「人说了不」与「根本没有审批通道」：`rejected` 与 `cancelled` 被描述为用户的决定，而 `unavailable` 明确说明这**不是**用户的决定。同一条规则也写进了两个受把关工具的 `description`，所以它在模型动手**之前**就已进入系统提示，而不只是事后才出现。
 
-**`rejected` 有两种来源，其中只有一种牵涉到人。** 在 `ask` 策略下它是「应答者说了不」；而在 `never` 策略下——官方 `danger-full-access` 预设选的就是它，因为那个预设把「完整文件权限」和「不弹审批窗」绑在了一起——DSH 的 `ApprovalService.decide()` 会在 `approval/request` 瀑布**之前**就返回 `rejected`，因此根本不存在弹窗，也没有任何人被询问。此时告诉模型「用户拒绝了」是**错误归因**，而且代价很高：它会打发模型去等待一个早已用「关掉询问」回答过的用户。所以插件会读 `ctx.approval.effectivePolicy(session)`（文档写明的公开读法），把这种拒绝另写一套措辞——决定它的是会话策略而不是人，解法是 `/permission`。
+### 当会话关闭审批提示
+
+官方 `danger-full-access` 预设把「完整文件权限」和 `approval: never` 绑在一起。`never` 下 DSH 的 `ApprovalService.decide()` 会在 `approval/request` 瀑布**之前**就返回 `rejected`，因此根本不存在弹窗，也没有任何应答者被询问（`docs/subsystems/approval.md`："`never` deterministically returns `rejected` without dispatching any answerer"）。在那里发起询问只能制造一个「没有人做过的拒绝」，所以插件干脆不问：它用 `ctx.approval.effectivePolicy(session)`（文档写明的公开读法）读出策略，直接执行动作，并把 `not-asked` 记进结果。
+
+`not-asked` 刻意**不是**审批结果之一：叫它 `allowed-once` 会假装存在一个并不存在的同意，叫它 `rejected` 又会拒绝一个会话从未询问过的动作。结果如实写明发生了什么：
 
 ```text
-browser_act 未执行：本次会话的审批策略是 "never"，DSH 在任何应答者被询问之前就自动拒绝了它。
-这不是用户拒绝了 tool "browser_act"——在 "never" 策略下不存在审批弹窗、也不会询问任何应答者，因此没有任何人做过这个决定。操作没有执行，页面保持原样。
-DSH 把本次会话的策略这样告诉模型："Approval prompts are disabled in this session: actions that require approval are rejected automatically."
-不要重试这个动作或等价动作。请告诉用户被拒绝的是什么，并请他们用 /permission 切换到一个审批策略为 "ask" 的预设——预设可以既保留完整文件权限、又保留询问（官方 "danger-full-access" 预设把完整文件权限和"不询问"绑在了一起，正是它关掉了询问）。
+click #checkout
+approval: not asked — this session disables approval prompts (policy "never"), so nobody reviewed the action
+page: https://shop.example/checkout
+screenshot (state before the action): …/before-click-….png
+screenshot (state AFTER the action): …/after-click-….png
 ```
 
-读不到策略时会退回「交互式拒绝」那套措辞，因为那是插件唯一能证明的情况；它绝不会凭空编造「是谁做的决定」。
+这种情形下动作前的那一帧文件名是 `before-…png` 而不是 `approval-…png`——本来就没有审批可以拿来命名。如果访问器缺失、或返回本版本不认识的值，插件无法证明策略，就会退回普通询问路径——这个兜底可能把策略性拒绝误归因给用户，这是 Host 没有暴露文档读法的代价。
 
 重复弹窗**不做**抑制：插件不去管模型的重复尝试，用户改变主意后仍然可以批准后一次。机械地抑制完全相同的重复请求固然能结束弹窗循环，但它也可能挡住一个已经改口说「继续」的用户，而且一次工具执行并不携带可用于把抑制限定在单个模型轮次内的轮次标识。
 
@@ -131,10 +136,10 @@ npm test
 | 入口 | 层次 | 依赖 | 检查项 |
 |---|---|---|---|
 | `npm run test:client` | Client 那一半，独立验证 | 仅需 Node | 97 |
-| `npm run test:acceptance` | Host 那一半，对接真实 DSH 服务 | Chrome | 169 |
+| `npm run test:acceptance` | Host 那一半，对接真实 DSH 服务 | Chrome | 165 |
 | `npm run test:real-load` | 两半一起，跑在真实的 `dsh` 进程内 | PATH 上有 `dsh` + Chrome | 24 |
 
-合计 **290 项检查，0 失败**——三个入口都需要先 `npm install`。最后一个入口会启动官方 `dsh` 二进制，把插件以 patch 方式挂进去，监听由操作系统分配的随机空闲端口（因此绝不会与你正在运行的任何 profile 冲突），并在该进程内运行一个探针插件，读取实时的各项注册表。如果 PATH 上没有 `dsh`，它会明确报告并以非零码退出。它会把该次启动的审批策略固定为 `ask`，这样默认预设为 `danger-full-access` 的 profile 就不会把这次运行变成对预设的判断，而不是对插件的判断。
+合计 **286 项检查，0 失败**——三个入口都需要先 `npm install`。最后一个入口会启动官方 `dsh` 二进制，把插件以 patch 方式挂进去，监听由操作系统分配的随机空闲端口（因此绝不会与你正在运行的任何 profile 冲突），并在该进程内运行一个探针插件，读取实时的各项注册表。如果 PATH 上没有 `dsh`，它会明确报告并以非零码退出。它会把该次启动的审批策略固定为 `ask`，这样默认预设为 `danger-full-access` 的 profile 就不会把这次运行变成对预设的判断，而不是对插件的判断。
 
 CI 在每次 push 时运行 Client bundle 验证与打包检查，因为这两项无需浏览器即可复现。浏览器相关的套件不在该门禁内——它们需要 Chrome，最后一个还需要 `dsh` CLI——因此改为手动触发的任务。
 

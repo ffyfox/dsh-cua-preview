@@ -2,9 +2,11 @@
 
 English | [中文](README.zh.md)
 
-A [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) plugin that drives a browser, with
-every navigating or acting call gated by a DSH approval — and with the current screen captured as a
-screenshot **the user reviews before the action runs**.
+A [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) plugin that drives a browser. In a
+session that allows approval prompts, every navigating or acting call is gated by a DSH approval — and
+the current screen is captured as a screenshot **the user reviews before the action runs**. In a session
+whose approval policy is `never` (prompts disabled, e.g. the shipped `danger-full-access` preset), no
+prompt can exist, so those calls run without asking and their results say `approval: not asked`.
 
 The approval architecture follows ZCode's `cua-permission-broker` as a design borrowing; no ZCode source
 is copied.
@@ -13,16 +15,18 @@ is copied.
 
 | Tool | Approval | Returns |
 |---|---|---|
-| `browser_navigate` | yes | the loaded page, after navigation |
-| `browser_act` (`click` / `fill` / `submit`) | yes | the page after the action |
+| `browser_navigate` | when the session asks | the loaded page, after navigation |
+| `browser_act` (`click` / `fill` / `submit`) | when the session asks | the page after the action |
 | `browser_snapshot` | no | the current URL, title and visible text |
 | `browser_screenshot` | no | the current screen as an image |
 
 The read-only pair never raises an approval, because neither can change the page. "After navigation"
 and "after the action" mean after the page has been given a bounded chance to react — see
-[Waiting for the page to react](#waiting-for-the-page-to-react). The gated pair asks
+[Waiting for the page to react](#waiting-for-the-page-to-react). In an `ask` session the gated pair asks
 first, in one line of the UI's own language wherever the Host still exposes that preference, and does
-nothing at all unless the answer is "allow once".
+nothing at all unless the answer is "allow once". In a `never` session there is no prompt to answer: the
+pair runs the action and the result says `approval: not asked` — see
+[when the session disables prompts](#when-the-session-disables-prompts).
 
 **That line is always English on DSH `0.2.0-rc.2`**, which removed the Host-side locale read a plugin
 could consult; on `0.1.5-rc.2`/`rc.3` it is localised. [docs/design.md](docs/design.md) has the
@@ -101,8 +105,9 @@ The task allowed Puppeteer or Playwright. Puppeteer was chosen, and specifically
 
 The approval happens **before** the action, so two frames exist and each is named for what it is. The
 **post-action** frame is what the model receives as its result image, because a model that reads a
-pre-action frame as "the result" concludes the action failed. The **approval-time** frame — the screen
-the user was asked to approve — is returned in the same result, first, captioned `before the action`, so
+pre-action frame as "the result" concludes the action failed. The **pre-action** frame — the screen the
+user was asked to approve, or, when prompts are disabled, the screen just before the action — is
+returned in the same result, first, captioned `before the action`, so
 the call's row reads as a timeline. Both ride in the call's own `tool/result` content, which is what makes
 them readable: the Host authorizes an attachment read only when a known event's content carries the
 reference, and `presentationMeta.frames` names each one's role. A plugin-owned session event cannot be
@@ -168,24 +173,32 @@ absent channel: `rejected` and `cancelled` are described as the user's decision,
 states explicitly that it was **not**. The same rule is in the gated tools' descriptions, so it reaches
 the model before it acts rather than only afterwards.
 
-**`rejected` has two sources, and only one of them involves a person.** Under the `ask` policy it means
-an answerer said no. Under `never` — which is what the shipped `danger-full-access` preset selects, since
-that preset bundles "full file access" with "no approval prompts" — DSH's `ApprovalService.decide()`
-returns `rejected` *before* the `approval/request` waterfall, so no prompt exists and nobody is asked.
-Telling the model "the user rejected it" there is a false attribution, and a costly one: it would send
-the model off to wait for a user who has already answered, by turning prompts off. The plugin therefore
-reads `ctx.approval.effectivePolicy(session)` (the documented accessor) and words that refusal
-differently — no human decided, the session policy did, and the way to unblock it is `/permission`.
+### When the session disables prompts
+
+The shipped `danger-full-access` preset pairs full file access with `approval: never`. Under `never`,
+DSH's `ApprovalService.decide()` returns `rejected` *before* the `approval/request` waterfall, so no
+prompt exists and no answerer is consulted (`docs/subsystems/approval.md`: "`never` deterministically
+returns `rejected` without dispatching any answerer"). An ask there could only produce a refusal nobody
+made, so the plugin does not raise one: it reads the policy through
+`ctx.approval.effectivePolicy(session)` — the documented consumer read — and runs the action, recording
+`not-asked`.
+
+`not-asked` is deliberately **not** an approval outcome. Calling it `allowed-once` would claim a consent
+that does not exist; calling it `rejected` would refuse an action the session never asked about. The
+result says what actually happened:
 
 ```text
-browser_act was NOT performed: this session's approval policy is "never", so DSH rejected it automatically, before any answerer could be asked.
-the user did NOT reject tool "browser_act" — under the "never" policy no approval prompt exists and no answerer is asked, so no human took this decision. Nothing ran and the page is unchanged.
-DSH states the session's policy to the model as: "Approval prompts are disabled in this session: actions that require approval are rejected automatically."
-Do not retry this action or an equivalent one. Tell the user what was refused, and ask them to run /permission and switch to a preset whose approval policy is "ask" — a preset can keep full file access and still ask (the shipped "danger-full-access" preset pairs full file access with no prompts, which is what disables this).
+click #checkout
+approval: not asked — this session disables approval prompts (policy "never"), so nobody reviewed the action
+page: https://shop.example/checkout
+screenshot (state before the action): …/before-click-….png
+screenshot (state AFTER the action): …/after-click-….png
 ```
 
-An unreadable policy degrades to the interactive wording, because that is the only case the plugin can
-prove; it never invents a claim about who decided.
+The pre-action frame is named `before-…png` in this case rather than `approval-…png`: there was no
+approval to name it after. If the accessor is missing or returns a value this build does not know, the
+plugin cannot prove the policy and falls back to the ordinary ask path — that fallback can mis-attribute
+a policy refusal to the user, which is the cost of a Host that does not expose the documented read.
 
 Repeat prompting is **not** suppressed: the plugin does not police the model's retries, and a user who
 changes their mind can still approve a later attempt. Suppressing an identical repeat would end the
@@ -207,10 +220,10 @@ Three entries, aimed at three different layers:
 | Entry | Layer | Needs | Checks |
 |---|---|---|---|
 | `npm run test:client` | the Client half, in isolation | Node only | 97 |
-| `npm run test:acceptance` | the Host half, against the real DSH services | Chrome | 169 |
+| `npm run test:acceptance` | the Host half, against the real DSH services | Chrome | 165 |
 | `npm run test:real-load` | both halves, inside a real `dsh` process | a `dsh` CLI + Chrome | 24 |
 
-That is **290 checks, 0 failures** — all three entries need `npm install` first. The last entry boots the
+That is **286 checks, 0 failures** — all three entries need `npm install` first. The last entry boots the
 shipped `dsh` binary with the plugin patched in on an OS-assigned free port — so it cannot collide with
 any profile you have running — and runs a probe plugin inside that process which reads the live
 registries. It reports clearly and exits non-zero if no `dsh` CLI is available. It pins the approval

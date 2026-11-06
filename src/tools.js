@@ -15,6 +15,7 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { SETTLE_DEFAULTS } from './browser.js'
+import { NOT_ASKED } from './approval-broker.js'
 import { approvalLanguage, describeAction, refusalNotice } from './action-text.js'
 
 /**
@@ -120,6 +121,25 @@ function settleNote(value) {
     ? `the page was still making network requests${waited}`
     : `the page's DOM was still changing${waited}`
   return [`settled: false — ${reason}; this frame may be mid-update`]
+}
+
+/**
+ * The `approval:` line for a gated result.
+ *
+ * `not-asked` is not an `ApprovalOutcome`: the session's policy disabled prompts, so the broker
+ * never asked anyone. Printing `allowed-once` there would read as a consent that does not exist;
+ * the model must not tell the user they approved something they were never shown. The long form
+ * states what happened instead, and names no human decision.
+ *
+ * @param {string} decision - the broker's decision.
+ * @param {boolean} [granted] - when given, appended as `(granted: …)`.
+ * @returns {string} one line.
+ */
+function approvalLine(decision, granted) {
+  if (decision === NOT_ASKED) {
+    return 'approval: not asked — this session disables approval prompts (policy "never"), so nobody reviewed the action'
+  }
+  return `approval: ${decision}${granted === undefined ? '' : ` (granted: ${String(granted)})`}`
 }
 
 /**
@@ -235,10 +255,12 @@ function gatedPresentationMeta(value) {
 }
 
 /**
- * Persist the approval-time frame so a gated result can carry it.
+ * Persist the pre-action frame so a gated result can carry it.
  *
- * The bytes are the broker's own capture; a frame-less ask (blank screen, capture failure) and a
- * failed save both yield null rather than an image the Host would refuse to serve.
+ * The bytes are the broker's own capture: the screen the user was shown when there was an
+ * approval, and the screen just before the action when the session's policy disabled prompts. A
+ * frame-less run (blank screen, capture failure) and a failed save both yield null rather than an
+ * image the Host would refuse to serve.
  *
  * @param ctx - plugin context carrying the optional attachment store.
  * @param outcome - the broker result.
@@ -261,28 +283,31 @@ async function saveApprovalFrame(ctx, outcome, logger) {
  * @param {object} [deps.logger] - logger.
  */
 export function registerBrowserTools(ctx, { browser, broker, logger, settle = SETTLE_DEFAULTS }) {
-  // ---- Read-only tools: no approval ------------------------------------------------------
+  // ---- Gated tool: navigation raises an approval when the session allows prompts ----------
 
   ctx.tools.register(defineTool({
     name: 'browser_navigate',
     description:
       'Open a URL in the plugin browser and return the resulting page title and URL. ' +
-      'Navigation is an approval-gated action: the user is asked before the page is opened. ' +
+      'Navigation is approval-gated: when the session\'s approval policy is "ask", the user is ' +
+      'asked before the page is opened, and nothing happens unless they allow it. When the policy ' +
+      'is "never" (approval prompts disabled; the shipped "danger-full-access" preset pairs full ' +
+      'file access with that), no prompt can exist, so the navigation runs without asking and the ' +
+      'result says "approval: not asked" — that is the session\'s policy, not a user approval, so ' +
+      'do not tell the user they approved it. ' +
       'If the result says the request was rejected or cancelled, the navigation did not ' +
       'happen and that is not a failure of the call — do not retry the same navigation, stop and ' +
-      'ask the user what to change or what to do next. Which it was matters: a result that says the ' +
-      'USER rejected it is a human decision, while one that says the session\'s approval policy ' +
-      'rejected it automatically means nobody was asked at all (the user has turned approval ' +
-      'prompts off), so do not tell the user they rejected it and do not expect a retry to help — ' +
-      'the unblocking move is theirs, a permission-preset switch. ' +
+      'ask the user what to change or what to do next. A rejection is a human decision; a result ' +
+      'that says no approval channel is available is not one, and retrying cannot help. ' +
       'The returned screenshot shows the page AFTER navigation, so it is the result: the plugin ' +
       'waits for the page to stop changing — its network quiet, its DOM stable — before capturing, ' +
       'bounded by the configured settle budget (3 s by default). If the result reports ' +
       '`settled: false`, that budget ran out first and the frame may still be mid-update. ' +
-      'A granted navigation returns two images in order: first the screen the user was shown when ' +
-      'they approved it (the card captions that one "before the action"), then the frame after ' +
-      'navigation. A first navigation from a blank tab has no approval-time screen and returns one ' +
-      'image; a refusal returns the approval-time screen alone.',
+      'A granted navigation returns two images in order: first the screen captured before the ' +
+      'action (the card captions that one "before the action" — with an approval it is the frame ' +
+      'the user reviewed; when the policy skipped asking it is the screen just before the ' +
+      'navigation), then the frame after navigation. A first navigation from a blank tab has no ' +
+      'pre-action screen and returns one image; a refusal returns the pre-action screen alone.',
     parameters: {
       url: { type: 'string', required: true, description: 'Absolute http(s) URL to open' },
     },
@@ -304,9 +329,6 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
           settled: { type: 'boolean' },
           settleMs: { type: 'integer' },
           networkBusy: { type: 'boolean' },
-          // Present only on a refusal the SESSION POLICY produced (nobody was asked), so the notice
-          // cannot attribute a policy decision to the user.
-          promptsDisabled: { type: 'boolean' },
         },
       },
       render: (args, value) => {
@@ -320,11 +342,13 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
                 // from collapsing into one claim.
                 ...(asked === null || samePage(asked, value.url) ? [] : [`landed at: ${value.url}`]),
                 `title: ${value.title}`,
-                `approval: ${value.decision}`,
-                // A blank-screen approval carries no frame, so it names no path either.
+                approvalLine(value.decision),
+                // A blank screen carries no frame, so it names no path either. The frame is the
+                // approval-time screen when there was an approval, and the pre-action screen when
+                // the session's policy skipped asking.
                 ...(value.approvalScreenshotPath === undefined
                   ? []
-                  : [`screenshot (state at approval time): ${value.approvalScreenshotPath}`]),
+                  : [`screenshot (${value.decision === NOT_ASKED ? 'state before the action' : 'state at approval time'}): ${value.approvalScreenshotPath}`]),
                 ...(value.screenshotPath === '' ? [] : [`screenshot (after navigation): ${value.screenshotPath}`]),
                 ...settleNote(value),
               ].join('\n')
@@ -335,13 +359,12 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
                   toolName: 'browser_navigate',
                   decision: value.decision,
                   language: approvalLanguageOf(ctx),
-                  promptsDisabled: value.promptsDisabled === true,
                 }),
                 '',
                 // Dropped, never guessed: `value.url` is the page the browser is still on, and
                 // printing it here is the defect this line exists for.
                 ...(asked === null ? [] : [`request: navigate -> ${asked}`]),
-                `approval: ${value.decision} (granted: false)`,
+                approvalLine(value.decision, false),
                 // The sibling gated tool states the untouched page on its own line; a refused
                 // navigation owes the model the same fact, stated as a fact.
                 `page: ${value.url}`,
@@ -393,6 +416,8 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
       }
     },
   }))
+
+  // ---- Read-only tools: no approval ------------------------------------------------------
 
   ctx.tools.register(defineTool({
     name: 'browser_snapshot',
@@ -460,30 +485,33 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
     },
   }))
 
-  // ---- Gated tool: click / fill / submit all raise an approval ---------------------------
+  // ---- Gated tool: click / fill / submit raise an approval when the session allows prompts --
 
   ctx.tools.register(defineTool({
     name: 'browser_act',
     description:
-      'Perform a side-effecting action on the plugin browser page. The user is asked to approve ' +
-      'the action first. Fails closed: anything other than an explicit one-shot approval performs ' +
-      'no action. If the result says the request was rejected or cancelled, nothing ran and ' +
-      'that is not a failure of the call — do not retry the same action or an ' +
-      'equivalent one, stop and ask the user what to change or what to do next. Which it was ' +
-      'matters: a result that says the USER rejected it is a human decision, while one that says ' +
-      'the session\'s approval policy rejected it automatically means nobody was asked at all (the ' +
-      'user has turned approval prompts off), so do not tell the user they rejected it and do not ' +
-      'expect a retry to help — the unblocking move is theirs, a permission-preset switch. ' +
+      'Perform a side-effecting action on the plugin browser page. When the session\'s approval ' +
+      'policy is "ask", the user is asked to approve the action first, and anything other than an ' +
+      'explicit one-shot approval performs no action. When the policy is "never" (approval prompts ' +
+      'disabled; the shipped "danger-full-access" preset pairs full file access with that), no ' +
+      'prompt can exist, so the action runs without asking and the result says ' +
+      '"approval: not asked" — that is the session\'s policy, not a user approval, so do not tell ' +
+      'the user they approved it. ' +
+      'If the result says the request was rejected or cancelled, nothing ran and that is not a ' +
+      'failure of the call — do not retry the same action or an equivalent one, stop and ask the ' +
+      'user what to change or what to do next. A rejection is a human decision; a result that says ' +
+      'no approval channel is available is not one, and retrying cannot help. ' +
       'Actions: `click` (activate a control), `fill` (replace a field\'s contents; it ' +
       'clears the field first rather than appending), `submit` (submit a form). ' +
-      'This result carries up to two images, in this order: the screen the user was shown when ' +
-      'they approved the action (the card captions that one "before the action" — it is the frame ' +
-      'they reviewed, and it is NOT the action\'s effect), then the screen AFTER the action ran. ' +
+      'This result carries up to two images, in this order: the screen captured before the action ' +
+      '(the card captions that one "before the action" — with an approval it is the frame the user ' +
+      'reviewed; when the policy skipped asking it is the screen just before the action; either ' +
+      'way it is NOT the action\'s effect), then the screen AFTER the action ran. ' +
       'The plugin waits for the page to stop changing — its network quiet, its DOM stable — before ' +
       'capturing the second frame, bounded by the configured settle budget (3 s by default). That ' +
       'second frame is normally the action\'s effect, so no follow-up screenshot is needed to ' +
       'confirm it; if the result reports `settled: false`, the budget ran out first and the frame ' +
-      'may still be mid-update. A refusal returns the approval-time frame alone. Each frame\'s file ' +
+      'may still be mid-update. A refusal returns the pre-action frame alone. Each frame\'s file ' +
       'path is reported in the result text for audit.',
     parameters: {
       action: {
@@ -521,21 +549,19 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
           settled: { type: 'boolean' },
           settleMs: { type: 'integer' },
           networkBusy: { type: 'boolean' },
-          // Present only on a refusal the SESSION POLICY produced (nobody was asked), so the notice
-          // cannot attribute a policy decision to the user.
-          promptsDisabled: { type: 'boolean' },
         },
       },
       render: (_args, value) => imageContent(
         value.granted
           ? [
               `${value.action} ${value.selector}`,
-              `approval: ${value.decision} (granted: true)`,
+              approvalLine(value.decision, true),
               `page: ${value.url}`,
-              // A blank-screen approval carries no frame, so it names no path either.
+              // A blank screen carries no frame, so it names no path either. With an approval this
+              // is the reviewed frame; with prompts disabled it is the screen just before the action.
               ...(value.approvalScreenshotPath === undefined
                 ? []
-                : [`screenshot (state at approval time): ${value.approvalScreenshotPath}`]),
+                : [`screenshot (${value.decision === NOT_ASKED ? 'state before the action' : 'state at approval time'}): ${value.approvalScreenshotPath}`]),
               ...(value.screenshotPath === '' ? [] : [`screenshot (state AFTER the action): ${value.screenshotPath}`]),
               ...settleNote(value),
             ].join('\n')
@@ -546,11 +572,10 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
                 toolName: 'browser_act',
                 decision: value.decision,
                 language: approvalLanguageOf(ctx),
-                promptsDisabled: value.promptsDisabled === true,
               }),
               '',
               `request: ${value.action} ${value.selector}`,
-              `approval: ${value.decision} (granted: false)`,
+              approvalLine(value.decision, false),
               `page: ${value.url}`,
               // The frame is the screen the user was looking at, and it is still the honest current
               // state: no action ran.
@@ -602,8 +627,6 @@ export function registerBrowserTools(ctx, { browser, broker, logger, settle = SE
             selector: args.selector,
             granted: false,
             decision: outcome.decision,
-            // `rejected` under the `never` policy means nobody was asked, which the notice must say.
-            ...(outcome.policy === 'never' ? { promptsDisabled: true } : {}),
             url: state.url,
             screenshotPath: outcome.screenshot?.path ?? '',
             ...(before === null ? {} : { image: before }),
@@ -710,9 +733,12 @@ async function runGated(broker, browser, input) {
     ...input,
     // The probe runs first so a blank tab produces no frame at all, rather than a white one.
     probeScreen: () => browser.screenState(),
-    capture: () => browser.screenshotToFile({
+    capture: (kind) => browser.screenshotToFile({
       directory: broker.artifactsDir,
-      name: `approval-${input.action}-${Date.now()}.png`,
+      // `approval-` when a card will show it; `before-` when the session disabled prompts and the
+      // frame is pre-action evidence only. The name is part of the audit trail, so it must not
+      // claim an approval that never happened.
+      name: `${kind}-${input.action}-${Date.now()}.png`,
     }),
   })
 }
@@ -768,9 +794,6 @@ async function refusedNavigate(ctx, browser, outcome, logger) {
     title: state.title,
     granted: false,
     decision: outcome.decision,
-    // `rejected` under the `never` policy means nobody was asked; the notice renders that fact
-    // instead of attributing a policy decision to the user.
-    ...(outcome.policy === 'never' ? { promptsDisabled: true } : {}),
     // No navigation happened, so there is no post-action frame; the approval-time frame is the
     // honest state to report. It may legitimately be absent (blank screen, capture failure),
     // which is why the schema declares both image fields optional.

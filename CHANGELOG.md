@@ -5,6 +5,28 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- **A session that disables approval prompts now runs the gated browser tools instead of refusing
+  them.** `danger-full-access` — the shipped preset — pairs full file access with `approval: never`;
+  under `never` DSH's `ApprovalService.decide()` returns `rejected` before the `approval/request`
+  waterfall is dispatched, so `browser_navigate` and `browser_act` could never run there
+  (`docs/subsystems/approval.md`: "`never` deterministically returns `rejected` without dispatching
+  any answerer"). An ask in that session could only produce a refusal nobody made, so the broker now
+  reads the policy (`ctx.approval.effectivePolicy(session)`) and, under `never`, does not ask: it
+  runs the action and records `not-asked` in the result, whose text says that nobody reviewed it.
+  `not-asked` is not an `ApprovalOutcome` — it is neither a consent (`allowed-once`) nor a refusal
+  (`rejected`) — and the pre-action frame is written as `before-*.png` because there is no approval
+  card to name it after. `ask` sessions are unchanged: the prompt, the refusal wording and the retry
+  guidance are exactly as before.
+
+### Removed
+
+- **The `never`-specific refusal wording and the `promptsDisabled` result field.** Both existed to
+  distinguish a policy refusal from a human one when the plugin still asked under `never`. It no
+  longer asks there, so neither is reachable: the refusal notice now always describes an outcome a
+  person or an answerer produced, and `not-asked` carries the policy fact in the result itself.
+
 ## [0.2.0] - 2026-10-03
 
 ### Fixed
@@ -64,8 +86,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the instant its own result exists (the result carries the same picture), and it is skipped entirely on a
   Host that mounts no such registry: the tools load and every gated action works either way. `connection`
   is deliberately **not** a declared dependency, so the route attaches through `ctx.inject` when that
-  service appears — a one-shot `ctx.get('connection')` inside `apply` was measured to lose that race in the
-  real web profile, which would have silently disabled the preview in the only profile that has one.
+  service appears — a one-shot `ctx.get('connection')` inside `apply` was measured to lose that race in a
+  real `dsh web` profile, where the preview would have been silently disabled.
 - **The post-action screenshot now waits for the page to react.** `page.click()` returns the moment the
   input is dispatched, and `goto` with `domcontentloaded` returns before a JS-rendered page has rendered
   anything, so the frame used to be the state the action *started* from: measured against a page whose
@@ -149,7 +171,7 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - The real-process check pins the approval policy to `ask`. A `web` profile whose default preset is
   `danger-full-access` gets `approval: never`, under which `ApprovalService.decide()` returns
   "rejected" *before* the `approval/request` waterfall — so the probe's own answerer was unreachable and
-  the run described the operator's preset rather than the plugin.
+  the run described the profile's preset rather than the plugin.
 - A granted `browser_navigate` now reports the URL that was **asked for** on its first line, and adds
   `landed at: <final URL>` only when the two differ, so a redirect is no longer indistinguishable from
   an ordinary load. `http://host:port` and `http://host:port/` count as the same page, so a plain

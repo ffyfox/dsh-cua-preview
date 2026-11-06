@@ -20,13 +20,15 @@ Four tools are registered into `ctx.tools`:
 
 | Tool | Approval-gated | Returns |
 |---|---|---|
-| `browser_navigate` | yes | the loaded page, post-navigation |
-| `browser_act` (`click` / `fill` / `submit`) | yes | the page after the action |
+| `browser_navigate` | when the session asks | the loaded page, post-navigation |
+| `browser_act` (`click` / `fill` / `submit`) | when the session asks | the page after the action |
 | `browser_snapshot` | no | the current URL, title and visible text |
 | `browser_screenshot` | no | the current screen as an image |
 
 The gated pair raises the approval from inside `execute()`, using the `agent` the execution carries.
-A tool execution is always inside an open turn, which is what `ctx.approval.request` requires.
+A tool execution is always inside an open turn, which is what `ctx.approval.request` requires. A
+session whose policy is `never` is the exception: there the broker skips the seam and records
+`not-asked` (see below).
 
 ## The two frames, and why there are two
 
@@ -38,7 +40,7 @@ Both are kept, each named for what it is:
 
 | Frame | Written as | Where it goes |
 |---|---|---|
-| Approval-time (pre-action) | `approval-*.png` | the result's first image block, captioned `before the action`; also `approvalScreenshotPath` for audit |
+| Pre-action (the approval-time screen, or the screen just before an ungated action) | `approval-*.png`, or `before-*.png` when prompts are disabled | the result's first image block, captioned `before the action`; also `approvalScreenshotPath` for audit |
 | Result (post-action) | `after-*.png` | the result's second image block, captioned `after the action` |
 
 The tool descriptions state this, so the rule is in the system prompt rather than being tribal
@@ -314,29 +316,34 @@ explicitly that it **was not** a decision by the user. The same rule is written 
 `description`, so it is in the system prompt *before* the model acts, not only in the result
 afterwards.
 
-### `rejected` has two sources, and only one involves a person
+### A session that disables prompts
 
 `rejected` is the right outcome for "a human declined" under the `ask` policy. Under `never` the same
-value arrives for a completely different reason: `ApprovalService.decide()` returns it *before* the
+value arrives without anyone being asked: `ApprovalService.decide()` returns it *before* the
 `approval/request` waterfall is dispatched, so no prompt exists and no answerer is consulted
 (`docs/subsystems/approval.md`: "`never` deterministically returns `rejected` without dispatching any
-answerer"). Nothing about the four-value outcome vocabulary distinguishes the two, so the plugin reads
-the policy itself — `ctx.approval.effectivePolicy(session)`, which the same doc line names as the
-consumer's read — **before** raising the request (reading it afterwards would describe the wrong
-decision if the user switched presets mid-ask).
+answerer"). An ask there can only manufacture a refusal nobody made, so the broker does not enter the
+seam at all. It reads the policy itself — `ctx.approval.effectivePolicy(session)`, the consumer read
+the same doc line names — **before** deciding:
+
+- `ask`, or a policy it cannot read: raise the request exactly as before.
+- `never`: run the action and record `not-asked`, the broker's own decision value. It is deliberately
+  not one of the four `ApprovalOutcome` values: `allowed-once` would claim a consent that does not
+  exist, and `rejected` would refuse an action the session never asked about.
+
+`not-asked` reaches the tool layer as a grant (`granted: true`), but the model-facing text says what
+happened — `approval: not asked — this session disables approval prompts (policy "never"), so nobody
+reviewed the action` — and the pre-action frame is named `before-*.png` rather than `approval-*.png`,
+because no approval card exists to show it. No `approval/asked` / `approval/decided` pair is written,
+because nothing was asked.
+
+The plugin does not decide the policy for the user: it only stops asking when the session already
+says prompts are off.
 
 Only the two documented vocabulary values are accepted. A Host that removes the accessor, renames it, or
-returns something this build has never seen degrades to `policy: null`, and the tool layer then falls
-back to the interactive wording — the only case the plugin can actually prove. It never invents a claim
-about who decided.
-
-Why it matters enough to carry a second paragraph of text into the result: the false version tells the
-model to wait for a user who has already answered, and to report to that user that they rejected
-something they were never shown. The true version names the actual unblocking move — a
-permission-preset switch — which is the user's to make. The preset that most often produces this is the
-shipped `danger-full-access`, which bundles `sandbox: danger-full-access` with `approval: never`; a
-profile that wants both full file access and prompts needs its own entry pairing `sandbox:
-danger-full-access` with `approval: ask`.
+returns something this build has never seen leaves the policy unreadable; the plugin then asks, as it
+did before, and cannot prove whether a resulting refusal came from a person or from the policy. That
+fallback is the cost of a Host that does not expose the documented read.
 
 The plugin does **not** police the model's retries: it makes the refusal legible and tells the model
 what to do instead. Recording a refused action and silently skipping the prompt on an identical retry
