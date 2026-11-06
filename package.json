@@ -1,6 +1,6 @@
 {
   "name": "dsh-cua-preview",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DSH plugin: browser automation whose click and submit actions are gated by a DSH approval, with the current screen captured as a screenshot the user reviews before the action runs.",
   "type": "module",
   "license": "MIT",

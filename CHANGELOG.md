@@ -5,6 +5,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-06
+
 ### Changed
 
 - **A session that disables approval prompts now runs the gated browser tools instead of refusing
